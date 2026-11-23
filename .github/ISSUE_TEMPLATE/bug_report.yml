@@ -1,0 +1,33 @@
+name: "🐛 Bug Report"
+description: "Report a bug in nexus-sync, cve-intel-mcp, patch-diff-mcp, scope-guard-mcp, or Docker setup"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - nexus-sync (Rust)
+        - cve-intel-mcp (Rust)
+        - patch-diff-mcp (Go)
+        - scope-guard-mcp (Go)
+        - Docker / BaaRai ARTEX integration
+        - Skills / Docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction Steps & Observed Output
+      placeholder: "Include exact command, OS/arch, and error output (do NOT include private tokens or confidential targets)."
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true

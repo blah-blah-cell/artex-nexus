@@ -1,0 +1,11 @@
+program: example-authorized-lab
+notes: >
+  Replace with your authorized bug bounty scope or owned lab environment before
+  running any security assessment. out_of_scope rules always take precedence.
+in_scope:
+  - "*.lab.example.com"
+  - "api.staging.example.com"
+  - "10.10.0.0/16"
+out_of_scope:
+  - "prod.lab.example.com"
+  - "payments.lab.example.com"
