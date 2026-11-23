@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Go
+/go/bin/
+/dist/
+/workspace/
+
+# Local databases, caches, and runtime evidence
+data/*.sqlite
+data/*.sqlite-*
+data/*.sqlite.zst
+data/*.sqlite.gz
+data/*.sqlite.tmp
+data/*.sqlite.building
+data/.cache/
+data/receipts/
+.tmp/
+
+# Secrets and local environment overrides
+.env
+.env.local
+config/artex.config.json
+config/*.local.yaml
+config/*-lab.yaml
+mcp_client.py
+*.sarif
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

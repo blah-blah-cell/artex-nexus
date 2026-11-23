@@ -1,0 +1,3 @@
+[submodule "vendor/ARTEX"]
+	path = vendor/ARTEX
+	url = https://github.com/BaaRai/ARTEX.git
