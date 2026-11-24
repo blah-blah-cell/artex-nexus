@@ -1,0 +1,20 @@
+name: "✨ Feature Request"
+description: "Suggest a new MCP tool, CVE/writeup data source, lockfile parser, or CWE playbook"
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Research Workflow Gap
+      placeholder: "What security research workflow would this improve?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      placeholder: "Describe the proposed MCP tool, CLI command, feed, or skill."
+    validations:
+      required: true

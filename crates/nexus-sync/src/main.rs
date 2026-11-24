@@ -2,9 +2,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
+use nexus_common::version::is_version_affected;
 use nexus_common::{
     AffectedProduct, CveRecord, PackageRange, SCHEMA_SQL, SCHEMA_VERSION, WriteupRecord,
-    severity_from_score,
+    detect_schema_version, open_readonly, severity_from_score,
 };
 use rayon::prelude::*;
 use regex::Regex;
@@ -78,6 +79,20 @@ enum Command {
     SeedKev {
         #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
         out: PathBuf,
+    },
+    /// Offline SBOM/lockfile vulnerability scan against local OSV/GHSA Medium+ CVE ranges
+    Scan {
+        #[arg(long, default_value = ".", help = "Target directory or lockfile (package-lock.json, package.json, requirements.txt, go.mod, Cargo.lock)")]
+        path: PathBuf,
+        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        db: PathBuf,
+        #[arg(long, help = "Output raw JSON instead of human-readable summary")]
+        json: bool,
+    },
+    /// Run health, schema, integrity, and coverage diagnostics on the local ARTEX-Nexus DB
+    Doctor {
+        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        db: PathBuf,
     },
 }
 
@@ -709,30 +724,45 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
                         if ecosystem.is_empty() || pkg_name.is_empty() {
                             continue;
                         }
-                        let mut intro = String::new();
-                        let mut fixed = String::new();
                         if let Some(ranges) = aff.get("ranges").and_then(Value::as_array) {
                             for rng in ranges {
+                                let mut intro = String::new();
+                                let mut fixed = String::new();
                                 if let Some(events) = rng.get("events").and_then(Value::as_array) {
                                     for ev in events {
                                         if let Some(i) = ev.get("introduced").and_then(Value::as_str) {
+                                            if !intro.is_empty() && !fixed.is_empty() {
+                                                pkgs.push(PackageRange {
+                                                    cve_id: cid.clone(),
+                                                    ecosystem: ecosystem.clone(),
+                                                    package_name: pkg_name.clone(),
+                                                    introduced_ver: intro.clone(),
+                                                    fixed_ver: fixed.clone(),
+                                                    advisory_id: adv_id.clone(),
+                                                });
+                                                fixed.clear();
+                                            }
                                             intro = i.to_string();
                                         }
                                         if let Some(f) = ev.get("fixed").and_then(Value::as_str) {
                                             fixed = f.to_string();
+                                        } else if let Some(la) = ev.get("last_affected").and_then(Value::as_str) {
+                                            fixed = format!("<={la}");
                                         }
                                     }
                                 }
+                                if !intro.is_empty() || !fixed.is_empty() {
+                                    pkgs.push(PackageRange {
+                                        cve_id: cid.clone(),
+                                        ecosystem: ecosystem.clone(),
+                                        package_name: pkg_name.clone(),
+                                        introduced_ver: intro,
+                                        fixed_ver: fixed,
+                                        advisory_id: adv_id.clone(),
+                                    });
+                                }
                             }
                         }
-                        pkgs.push(PackageRange {
-                            cve_id: cid.clone(),
-                            ecosystem,
-                            package_name: pkg_name,
-                            introduced_ver: intro,
-                            fixed_ver: fixed,
-                            advisory_id: adv_id.clone(),
-                        });
                     }
                 }
             }
@@ -1171,6 +1201,260 @@ fn cmd_seed_kev(out: &Path) -> Result<()> {
     Ok(())
 }
 
+fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)> {
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut deps = Vec::new();
+    match fname {
+        "package-lock.json" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                if let Some(pkgs) = v.get("packages").and_then(Value::as_object) {
+                    for (k, val) in pkgs {
+                        if let Some(ver) = val.get("version").and_then(Value::as_str)
+                            && let Some(name) = k.rsplit("node_modules/").next()
+                            && !name.is_empty()
+                        {
+                            deps.push(("npm".to_string(), name.to_string(), ver.to_string()));
+                        }
+                    }
+                } else if let Some(dmap) = v.get("dependencies").and_then(Value::as_object) {
+                    for (name, val) in dmap {
+                        if let Some(ver) = val.get("version").and_then(Value::as_str) {
+                            deps.push(("npm".to_string(), name.clone(), ver.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        "package.json" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                for key in ["dependencies", "devDependencies"] {
+                    if let Some(map) = v.get(key).and_then(Value::as_object) {
+                        for (name, ver) in map {
+                            if let Some(vs) = ver.as_str() {
+                                deps.push(("npm".to_string(), name.clone(), vs.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "requirements.txt" => {
+            for line in raw.lines() {
+                let l = line.split('#').next().unwrap_or("").trim();
+                if l.is_empty() || l.starts_with('-') {
+                    continue;
+                }
+                if let Some((pkg, ver)) = l.split_once("==") {
+                    deps.push(("PyPI".to_string(), pkg.trim().to_string(), ver.trim().to_string()));
+                }
+            }
+        }
+        "go.mod" => {
+            for line in raw.lines() {
+                let l = line.split("//").next().unwrap_or("").trim();
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1].starts_with('v') && !matches!(parts[0], "go" | "module" | "toolchain") {
+                    let name = if parts[0] == "require" && parts.len() >= 3 {
+                        parts[1]
+                    } else {
+                        parts[0]
+                    };
+                    let ver = if parts[0] == "require" && parts.len() >= 3 {
+                        parts[2]
+                    } else {
+                        parts[1]
+                    };
+                    deps.push(("Go".to_string(), name.to_string(), ver.trim_start_matches('v').to_string()));
+                }
+            }
+        }
+        "Cargo.lock" => {
+            let mut cur_name = String::new();
+            for line in raw.lines() {
+                let l = line.trim();
+                if l == "[[package]]" {
+                    cur_name.clear();
+                } else if let Some(rest) = l.strip_prefix("name = \"") {
+                    cur_name = rest.trim_end_matches('"').to_string();
+                } else if let Some(rest) = l.strip_prefix("version = \"")
+                    && !cur_name.is_empty()
+                {
+                    deps.push((
+                        "crates.io".to_string(),
+                        cur_name.clone(),
+                        rest.trim_end_matches('"').to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    deps
+}
+
+fn cmd_scan(path: &Path, db_path: &Path, as_json: bool) -> Result<()> {
+    let start = Instant::now();
+    let conn = open_readonly(db_path)?;
+    if detect_schema_version(&conn) < 2 {
+        anyhow::bail!("Scan requires v2 DB with OSV packages. Run `nexus-sync fetch` first.");
+    }
+
+    let targets: Vec<PathBuf> = if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        WalkDir::new(path)
+            .max_depth(4)
+            .into_iter()
+            .filter_entry(|e| {
+                !matches!(
+                    e.file_name().to_str(),
+                    Some(".git" | "node_modules" | "target" | "vendor" | ".venv")
+                )
+            })
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().is_file()
+                    && matches!(
+                        e.file_name().to_str(),
+                        Some("package-lock.json" | "package.json" | "requirements.txt" | "go.mod" | "Cargo.lock")
+                    )
+            })
+            .map(|e| e.into_path())
+            .collect()
+    };
+
+    let mut seen = HashSet::new();
+    let mut findings = Vec::new();
+    let mut deps_checked = 0usize;
+
+    let mut stmt = conn.prepare(
+        "SELECT p.cve_id, p.introduced_ver, p.fixed_ver, p.advisory_id,
+                c.cvss_score, c.cvss_severity, c.is_kev, c.epss_score, c.title
+         FROM cve_packages p
+         JOIN cves c ON c.cve_id = p.cve_id
+         WHERE LOWER(p.ecosystem) = LOWER(?1) AND LOWER(p.package_name) = LOWER(?2)",
+    )?;
+
+    for file in &targets {
+        for (eco, name, ver) in parse_dependencies_from_file(file) {
+            if !seen.insert((eco.clone(), name.clone(), ver.clone())) {
+                continue;
+            }
+            deps_checked += 1;
+            let rows = stmt.query_map(params![&eco, &name], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, i64>(6)? == 1,
+                    r.get::<_, Option<f64>>(7)?,
+                    r.get::<_, String>(8)?,
+                ))
+            })?;
+            for (cve_id, intro, fixed, adv, score, sev, is_kev, epss, title) in rows.flatten() {
+                if is_version_affected(&ver, &intro, &fixed) == Some(true) {
+                    findings.push(serde_json::json!({
+                        "file": file.display().to_string(),
+                        "ecosystem": eco,
+                        "package": name,
+                        "installed": ver,
+                        "fixed": fixed,
+                        "cve_id": cve_id,
+                        "advisory_id": adv,
+                        "cvss_score": score,
+                        "severity": sev,
+                        "is_kev": is_kev,
+                        "epss_score": epss,
+                        "title": title
+                    }));
+                }
+            }
+        }
+    }
+
+    let report = serde_json::json!({
+        "manifests_scanned": targets.len(),
+        "dependencies_checked": deps_checked,
+        "vulnerabilities_found": findings.len(),
+        "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
+        "findings": findings
+    });
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "ARTEX-Nexus Offline SBOM Scan: {} manifests, {} deps checked, {} Medium+ vulnerabilities found ({:.2} ms)",
+            targets.len(),
+            deps_checked,
+            findings.len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        for f in &findings {
+            println!(
+                "  [{} | CVSS {} | KEV={}] {}@{} ({}) -> fix: {} | {} ({})",
+                f["severity"].as_str().unwrap_or("?"),
+                f["cvss_score"],
+                f["is_kev"],
+                f["package"].as_str().unwrap_or(""),
+                f["installed"].as_str().unwrap_or(""),
+                f["ecosystem"].as_str().unwrap_or(""),
+                f["fixed"].as_str().unwrap_or("none"),
+                f["cve_id"].as_str().unwrap_or(""),
+                f["advisory_id"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_doctor(db_path: &Path) -> Result<()> {
+    let start = Instant::now();
+    let conn = open_readonly(db_path)?;
+    let schema = detect_schema_version(&conn);
+    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    let total_cves: i64 = conn.query_row("SELECT COUNT(*) FROM cves", [], |r| r.get(0))?;
+    let total_writeups: i64 = conn.query_row("SELECT COUNT(*) FROM writeups", [], |r| r.get(0))?;
+    let kev_count: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| r.get(0))?;
+    let total_packages: i64 = if schema >= 2 {
+        conn.query_row("SELECT COUNT(*) FROM cve_packages", [], |r| r.get(0))?
+    } else {
+        0
+    };
+    let writeups_with_text: i64 = if schema >= 2 {
+        conn.query_row("SELECT COUNT(*) FROM writeups WHERE length(content_excerpt) > 0", [], |r| r.get(0))?
+    } else {
+        0
+    };
+    let built_at: String = conn
+        .query_row("SELECT value FROM metadata WHERE key = 'built_at'", [], |r| r.get(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": if check == "ok" { "healthy" } else { "corrupt" },
+            "db_path": db_path.display().to_string(),
+            "schema_version": schema,
+            "quick_check": check,
+            "built_at": built_at,
+            "total_cves": total_cves,
+            "kev_count": kev_count,
+            "total_writeups": total_writeups,
+            "writeups_with_text": writeups_with_text,
+            "total_packages": total_packages,
+            "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0
+        }))?
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -1252,6 +1536,8 @@ fn main() -> Result<()> {
             force,
         } => cmd_fetch(&repo, &tag, &out, force)?,
         Command::SeedKev { out } => cmd_seed_kev(&out)?,
+        Command::Scan { path, db, json } => cmd_scan(&path, &db, json)?,
+        Command::Doctor { db } => cmd_doctor(&db)?,
     }
     Ok(())
 }

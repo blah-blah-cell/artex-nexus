@@ -1,3 +1,5 @@
+pub mod version;
+
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
