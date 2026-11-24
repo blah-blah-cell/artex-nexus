@@ -41,9 +41,7 @@ services:
       context: .
       dockerfile: Dockerfile.mcp
     restart: unless-stopped
-    command: ["python", "-m", "mcps.cve_intel_mcp.server", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8901"]
-    environment:
-      CVE_DB_PATH: /data/cve_kb_med_plus.sqlite
+    command: ["cve-intel-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8901", "--db-path", "/data/cve_kb_med_plus.sqlite"]
     ports:
       - "127.0.0.1:8901:8901"
     volumes:
@@ -54,23 +52,18 @@ services:
       context: .
       dockerfile: Dockerfile.mcp
     restart: unless-stopped
-    command: ["python", "-m", "mcps.patch_diff_mcp.server", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8902"]
+    command: ["patch-diff-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8902"]
     environment:
-      CVE_DB_PATH: /data/cve_kb_med_plus.sqlite
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     ports:
       - "127.0.0.1:8902:8902"
-    volumes:
-      - ./data:/data:ro
 
   scope-guard-mcp:
     build:
       context: .
       dockerfile: Dockerfile.mcp
     restart: unless-stopped
-    command: ["python", "-m", "mcps.scope_guard_mcp.server", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8903"]
-    environment:
-      SCOPE_RECEIPT_DIR: /data/receipts
+    command: ["scope-guard-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8903", "--config-dir", "/config", "--state-dir", "/data/receipts"]
     ports:
       - "127.0.0.1:8903:8903"
     volumes:

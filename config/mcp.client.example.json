@@ -1,25 +1,16 @@
 {
   "mcpServers": {
     "cve-intel-mcp": {
-      "command": "python",
-      "args": ["-m", "mcps.cve_intel_mcp.server", "--transport", "stdio"],
-      "env": {
-        "CVE_DB_PATH": "data/cve_kb_med_plus.sqlite"
-      }
+      "command": "./target/release/cve-intel-mcp",
+      "args": ["--transport", "stdio", "--db-path", "data/cve_kb_med_plus.sqlite"]
     },
     "patch-diff-mcp": {
-      "command": "python",
-      "args": ["-m", "mcps.patch_diff_mcp.server", "--transport", "stdio"],
-      "env": {
-        "CVE_DB_PATH": "data/cve_kb_med_plus.sqlite"
-      }
+      "command": "./go/bin/patch-diff-mcp",
+      "args": ["--transport", "stdio"]
     },
     "scope-guard-mcp": {
-      "command": "python",
-      "args": ["-m", "mcps.scope_guard_mcp.server", "--transport", "stdio"],
-      "env": {
-        "SCOPE_RECEIPT_DIR": "data/receipts"
-      }
+      "command": "./go/bin/scope-guard-mcp",
+      "args": ["--transport", "stdio", "--config-dir", "config", "--state-dir", "data/receipts"]
     }
   },
   "artexHttpServers": {

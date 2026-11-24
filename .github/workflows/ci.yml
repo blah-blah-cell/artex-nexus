@@ -7,22 +7,39 @@ on:
     branches: [main]
 
 jobs:
-  test-and-lint:
+  rust-check-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.11"
+          components: clippy
 
-      - name: Install dependencies
-        run: pip install -e ".[dev,compression]"
+      - name: Run cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run Ruff lint
-        run: ruff check pipeline mcps tests
+      - name: Run cargo test
+        run: cargo test --workspace
 
-      - name: Run Pytest suite
-        run: pytest -v
+  go-check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+          cache-dependency-path: go/go.sum
+
+      - name: Run go vet
+        working-directory: go
+        run: go vet ./...
+
+      - name: Run go test with race detector
+        working-directory: go
+        run: go test -race -v ./...

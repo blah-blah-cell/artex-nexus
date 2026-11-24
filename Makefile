@@ -1,19 +1,24 @@
-.PHONY: install bootstrap bootstrap-kev test lint up down
+.PHONY: build fetch seed-kev test lint up down
 
-install:
-	pip install -e ".[dev,compression]"
+build:
+	cargo build --release --workspace
+	mkdir -p go/bin
+	cd go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/patch-diff-mcp ./cmd/patch-diff-mcp
+	cd go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/scope-guard-mcp ./cmd/scope-guard-mcp
 
-bootstrap:
-	python -m pipeline.bootstrap
+fetch:
+	./target/release/nexus-sync fetch
 
-bootstrap-kev:
-	python -m pipeline.bootstrap --kev-seed
+seed-kev:
+	./target/release/nexus-sync seed-kev
 
 test:
-	pytest -v
+	cargo test --workspace
+	cd go && go test -race -v ./...
 
 lint:
-	ruff check .
+	cargo clippy --workspace --all-targets -- -D warnings
+	cd go && go vet ./...
 
 up:
 	docker compose up -d --build

@@ -1,12 +1,24 @@
-FROM python:3.11-slim
+# Multi-stage Rust + Go build for ARTEX-Nexus native MCP servers
+FROM rust:1.88-slim-bookworm AS rust-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+RUN cargo build --release --workspace
 
+FROM golang:1.26-bookworm AS go-builder
+WORKDIR /src/go
+COPY go/go.mod go/go.sum* ./
+RUN go mod download
+COPY go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/patch-diff-mcp ./cmd/patch-diff-mcp && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scope-guard-mcp ./cmd/scope-guard-mcp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=rust-builder /src/target/release/nexus-sync /usr/local/bin/nexus-sync
+COPY --from=rust-builder /src/target/release/cve-intel-mcp /usr/local/bin/cve-intel-mcp
+COPY --from=go-builder /out/patch-diff-mcp /usr/local/bin/patch-diff-mcp
+COPY --from=go-builder /out/scope-guard-mcp /usr/local/bin/scope-guard-mcp
 WORKDIR /app
-COPY pyproject.toml /app/pyproject.toml
-COPY pipeline /app/pipeline
-COPY mcps /app/mcps
-
-RUN pip install --no-cache-dir .
-
-ENV PYTHONUNBUFFERED=1
 ENV MCP_HOST=0.0.0.0
-ENV MCP_TRANSPORT=streamable-http
+ENV MCP_TRANSPORT=http

@@ -1,102 +1,97 @@
 # ARTEX-Nexus
 
-**The open-source AI cybersecurity research platform uniting all public Medium+ CVEs & writeups, [`BaaRai/ARTEX`](https://github.com/BaaRai/ARTEX), dual-transport custom MCP servers, and universal agent instructions.**
+**High-performance Rust + Go cybersecurity research platform uniting all public Medium+ CVEs, OSV/GHSA advisory writeups & package version ranges, [`BaaRai/ARTEX`](https://github.com/BaaRai/ARTEX), dual-transport native MCP servers, and universal agent instructions.**
 
 > **Authorized Use Only:** Designed strictly for authorized security research, bug bounty programs within declared scope, white-box auditing, and defensive engineering. See [SECURITY.md](SECURITY.md).
 
 ---
 
-## Architecture
+## Architecture (Native Rust + Go)
 
 ```mermaid
 flowchart TB
     ARTEX["BaaRai/ARTEX (Go + Next.js + Postgres)\nAutonomous Planner & Workers"]
     IDE["AI Coding Agents\n(Antigravity / Claude Code / Cursor)"]
 
-    subgraph MCPs["Dual-Transport MCP Servers (HTTP/SSE + stdio)"]
-        CVE["cve-intel-mcp (:8901)\nAll Med+ CVEs, Writeups, KEV, EPSS"]
-        PATCH["patch-diff-mcp (:8902)\nPublic CVE Commit/PR Diffs"]
-        SCOPE["scope-guard-mcp (:8903)\nAllow/Deny Scope & SHA-256 Receipts"]
+    subgraph Rust["Rust Engine (Cargo Workspace)"]
+        SYNC["nexus-sync\nParallel Rayon Builder + ETag/Zstd/Atomic Fetcher"]
+        CVE["cve-intel-mcp (:8901)\nDual-FTS5 CVEs, Writeups, OSV, Exact CWEs"]
     end
 
-    DB[("data/cve_kb_med_plus.sqlite\nSQLite FTS5 (~250k+ Med+ CVEs)")]
+    subgraph Go["Go Hardened Services (CGO_ENABLED=0)"]
+        PATCH["patch-diff-mcp (:8902)\nSSRF-Proof No-Redirect Diff Analyzer"]
+        SCOPE["scope-guard-mcp (:8903)\nConfined Per-Task Scope + Hash-Chained Ledger"]
+    end
+
+    DB[("data/cve_kb_med_plus.sqlite\nv2 SQLite + Dual FTS5 (~228k+ Med+ CVEs)")]
     SKILLS["skills/*/SKILL.md + AGENTS.md + CLAUDE.md"]
 
-    ARTEX -- "mcphttp (Streamable HTTP)" --> MCPs
+    SYNC -. "ETag + SHA-256 + atomic swap" .-> DB
+    ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> CVE
+    ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> PATCH
+    ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> SCOPE
     ARTEX -- "ARTEX_SKILL_DIR" --> SKILLS
-    IDE -- "stdio MCP" --> MCPs
-    IDE --> SKILLS
+    IDE -- "stdio JSON-RPC 2.0" --> CVE
+    IDE -- "stdio JSON-RPC 2.0" --> PATCH
+    IDE -- "stdio JSON-RPC 2.0" --> SCOPE
     CVE --> DB
-    PATCH --> DB
 ```
 
-## What's Inside
+## Key Engineering Highlights (v0.2 Rust + Go Rewrite)
 
-1. **All Public Medium+ CVEs (CVSS ≥ 4.0) & Writeups Pipeline (`pipeline/`)**
-   - Aggregates official **CVE JSON 5.0** (`CVEProject/cvelistV5`), **CISA KEV**, **FIRST.org EPSS**, and public writeups/PoC/patch references (`trickest/cve`, `projectdiscovery/nuclei-templates`, vendor advisories).
-   - Nightly GitHub Actions builds and publishes a compressed **SQLite + FTS5** database (`cve_kb_med_plus.sqlite.zst`) to **GitHub Releases** so cloning the repo stays instant while giving you sub-50ms offline search over all Medium, High, and Critical CVEs.
-2. **`BaaRai/ARTEX` Submodule & Unified Stack (`vendor/ARTEX`, `docker-compose.yml`)**
-   - Launches PostgreSQL, `BaaRai/ARTEX` (pre-mounted with our `skills/` directory via `ARTEX_SKILL_DIR`), and all 3 MCP servers over Streamable HTTP.
-3. **3 Brand-New Dual-Transport Custom MCP Servers (`mcps/`)**
-   - **`cve-intel-mcp`** (`search_cves`, `get_cve_details`, `match_product_cves`, `list_cwe_writeups`, `get_kb_stats`)
-   - **`patch-diff-mcp`** (`find_patch_links_for_cve`, `fetch_cve_patch_diff`, `extract_diff_hunks`) — allowlisted HTTPS hosts (`github.com`, `api.github.com`, `gitlab.com`)
-   - **`scope-guard-mcp`** (`load_scope_policy`, `check_target_in_scope`, `list_in_scope_assets`, `record_evidence_receipt`, `export_report`) — deterministic wildcard/CIDR allow/deny enforcement + tamper-evident SHA-256 receipts + Markdown/SARIF 2.1.0 export
-4. **Universal Agent Instructions & Skills (`AGENTS.md`, `CLAUDE.md`, `.cursor/rules/`, `skills/`)**
-   - Works out-of-the-box with **BaaRai/ARTEX**, **Antigravity**, **Claude Code**, **Cursor**, and any MCP-compatible client.
+1. **Rust Parallel Ingestion & Streaming Local DB Fetcher (`crates/nexus-sync`)**
+   - Multi-threaded `rayon` ingestion of `CVEProject/cvelistV5`, **CISA KEV**, **FIRST.org EPSS**, **GitHub Advisory Database (GHSA/OSV)** (real advisory writeup excerpts + exact package `introduced`/`fixed` version ranges), `trickest/cve`, and `projectdiscovery/nuclei-templates`.
+   - **Zero fabricated data**: unscored KEV entries store `cvss_score = NULL` with `cvss_severity = 'KEV_UNSCORED'` instead of invented scores.
+   - **Normalized v2 schema**: dedicated `cve_cwes` join table (exact CWE matching — `CWE-79` never matches `CWE-798`), `cve_packages` table for OSV ranges, `exploit_maturity` ranking (`KEV_EXPLOITED` > `NUCLEI_VERIFIED` > `POC_PUBLIC` > `PATCH_ONLY` > `NONE`), and dual FTS5 indexes (`cves_fts` + `writeups_fts`).
+   - **Production-grade `nexus-sync fetch`**: HTTP ETag (`If-None-Match` -> instant `304 Not Modified`), streaming download with on-the-fly SHA-256 verification, streaming Zstd decompression, `PRAGMA quick_check`, and atomic file swap so live MCP servers never see a partial DB.
+2. **Rust Native `cve-intel-mcp` (`crates/cve-intel-mcp`)**
+   - Single static binary with bundled SQLite + FTS5 + memory-mapped I/O (`PRAGMA mmap_size = 256MB`).
+   - Speaks both `stdio` and ARTEX Streamable HTTP (`POST /mcp`, protocol `2025-11-25`).
+   - Tools: `search_cves`, `search_writeups`, `get_cve_details`, `match_product_cves`, `list_cwe_writeups`, `whats_new`, `get_kb_stats`.
+3. **Go Hardened `patch-diff-mcp` (`go/cmd/patch-diff-mcp`)**
+   - Maps `github.com/{owner}/{repo}/commit|pull/...` directly to `api.github.com` (`Accept: application/vnd.github.diff`) with **all redirects disabled** (`http.ErrUseLastResponse`) and a custom DNS-validating `DialContext` that blocks loopback, RFC1918, CGNAT, and cloud metadata IPs (`169.254.169.254`).
+4. **Go Hardened `scope-guard-mcp` (`go/cmd/scope-guard-mcp`)**
+   - **Path confinement**: `load_scope_policy` resolves symlinks and strictly blocks traversal or files outside `SCOPE_CONFIG_DIR`.
+   - **Multi-tenant persisted scopes**: keyed by `scope_id` (so concurrent ARTEX tasks stay isolated) and persisted atomically to disk.
+   - **Cryptographically hash-chained ledger**: every receipt links `prev_sha256` -> `sha256` in append-only `receipts.jsonl`, verifiable end-to-end with `verify_ledger_chain`, and exportable to Markdown or SARIF 2.1.0.
 
 ---
 
 ## Quick Start
 
-### 1. Clone with the ARTEX submodule
+### 1. Clone with the `BaaRai/ARTEX` submodule
 ```bash
 git clone --recurse-submodules https://github.com/blah-blah-cell/artex-nexus.git
 cd artex-nexus
 ```
 
-### 2. Install Python dependencies & bootstrap the Medium+ CVE database
+### 2. Build native Rust + Go binaries & fetch the Medium+ CVE DB
 ```bash
-pip install -e ".[dev,compression]"
+make build
 
-# Option A: Download the full nightly Medium+ CVE + Writeups SQLite DB from GitHub Releases
-python -m pipeline.bootstrap
+# Stream-download latest nightly Medium+ CVE, OSV & Writeups SQLite DB (ETag + SHA-256 + atomic swap)
+./target/release/nexus-sync fetch
 
-# Option B: Build an instant 5-second starter DB from live CISA KEV + EPSS
-python -m pipeline.bootstrap --kev-seed
+# Or build an instant local starter DB from live CISA KEV + EPSS
+./target/release/nexus-sync seed-kev
 ```
 
-### 3. Launch ARTEX + MCP HTTP Stack (Docker Compose)
+### 3. Launch `BaaRai/ARTEX` + Native MCP HTTP Stack
 ```bash
 cp .env.example .env   # Set POSTGRES_PASSWORD
 docker compose up -d --build
 ```
 - ARTEX Web Console: `http://localhost:8787`
-- MCP HTTP Endpoints (for ARTEX `mcphttp` config):
+- Native Streamable HTTP MCP Endpoints (for ARTEX `mcphttp`):
   - `http://cve-intel-mcp:8901/mcp`
   - `http://patch-diff-mcp:8902/mcp`
   - `http://scope-guard-mcp:8903/mcp`
 
-### 4. Connect to IDE Agents (stdio MCP)
-Copy the server entries from [`config/mcp.client.example.json`](config/mcp.client.example.json) into your Antigravity, Claude Code, or Cursor MCP settings.
-
----
-
-## Building the Full Medium+ CVE Database Locally
-```bash
-git clone --depth 1 https://github.com/CVEProject/cvelistV5.git /tmp/cvelistV5
-git clone --depth 1 https://github.com/trickest/cve.git /tmp/trickest-cve
-git clone --depth 1 https://github.com/projectdiscovery/nuclei-templates.git /tmp/nuclei-templates
-
-python -m pipeline.sync_cves \
-  --source-dir /tmp/cvelistV5/cves \
-  --trickest-dir /tmp/trickest-cve \
-  --nuclei-dir /tmp/nuclei-templates \
-  --min-cvss 4.0 \
-  --compress
-```
+### 4. Connect to IDE Agents (`stdio` MCP)
+Copy the server entries from [`config/mcp.client.example.json`](config/mcp.client.example.json) into your Antigravity, Claude Code, or Cursor MCP configuration.
 
 ---
 
 ## License
-- ARTEX-Nexus code, MCP servers, pipeline, and skills: **MIT** ([LICENSE](LICENSE))
+- ARTEX-Nexus Rust/Go binaries, MCP servers, and skills: **MIT** ([LICENSE](LICENSE))
 - `vendor/ARTEX` submodule (`BaaRai/ARTEX`): **AGPL-3.0** ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md))

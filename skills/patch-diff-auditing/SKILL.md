@@ -5,7 +5,7 @@ description: Analyze public CVE security commits and PRs using patch-diff-mcp to
 
 # Patch-Diff Auditing Skill
 
-1. Resolve patch URLs via `patch-diff-mcp:find_patch_links_for_cve(cve_id)`.
+1. Resolve patch URLs via `cve-intel-mcp:get_cve_details(cve_id)` (filtering `writeups` where `has_patch_diff == true`).
 2. Fetch the unified diff via `patch-diff-mcp:fetch_cve_patch_diff(url)` and inspect `analysis.security_signals`.
 3. Classify the fix mechanism:
    - Input validation / canonicalization added?

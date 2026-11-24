@@ -1,20 +1,18 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
+# Rust
+/target/
+**/*.rs.bk
+
+# Go
+/go/bin/
 
 # Local databases, caches, and runtime evidence
 data/*.sqlite
-data/*.sqlite-wal
-data/*.sqlite-shm
+data/*.sqlite-*
 data/*.sqlite.zst
 data/*.sqlite.gz
-data/cache/
+data/*.sqlite.tmp
+data/*.sqlite.building
+data/.cache/
 data/receipts/
 .tmp/
 
