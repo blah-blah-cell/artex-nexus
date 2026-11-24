@@ -71,10 +71,7 @@ pub fn is_version_affected(installed: &str, introduced: &str, fixed: &str) -> Op
     let meets_intro = if introduced.trim().is_empty() || introduced.trim() == "0" {
         true
     } else {
-        match ParsedVersion::parse(introduced) {
-            Some(intro) => inst >= intro,
-            None => return None,
-        }
+        inst >= ParsedVersion::parse(introduced)?
     };
     if !meets_intro {
         return Some(false);

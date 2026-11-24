@@ -10,7 +10,6 @@ members = [
 version = "0.3.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/blah-blah-cell/artex-nexus"
 
 [workspace.dependencies]
 anyhow = "1"
