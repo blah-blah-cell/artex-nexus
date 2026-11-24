@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 patch-diff-mcp: Dual-transport (stdio + Streamable HTTP / SSE) MCP server for
 fetching public CVE patch diffs from allowlisted code hosts and extracting
@@ -16,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+
 from mcps.compat import create_mcp_server, run_mcp_server
 
 DEFAULT_DB = Path(os.environ.get("CVE_DB_PATH", "data/cve_kb_med_plus.sqlite"))

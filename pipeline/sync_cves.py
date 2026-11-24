@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ARTEX-Nexus Medium+ CVE & Public Writeups Ingestion Pipeline.
 
@@ -21,23 +20,23 @@ import gzip
 import hashlib
 import io
 import json
-import os
 import re
 import sqlite3
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 EPSS_CSV_GZ_URL = "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz"
 
 PATCH_URL_PATTERNS = (
-    re.compile(r"https?://github\.com/[^/]+/[^/]+/(commit|pull)/", re.I),
-    re.compile(r"https?://gitlab\.com/.+/-/commit/", re.I),
-    re.compile(r"https?://git\.kernel\.org/", re.I),
+    re.compile(r"https?://github\.com/[^/]+/[^/]+/(commit|pull)/", re.IGNORECASE),
+    re.compile(r"https?://gitlab\.com/.+/-/commit/", re.IGNORECASE),
+    re.compile(r"https?://git\.kernel\.org/", re.IGNORECASE),
 )
 
 WRITEUP_DOMAINS = (
@@ -58,7 +57,7 @@ WRITEUP_DOMAINS = (
     "advisories",
 )
 
-CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
+CVE_ID_RE = re.compile(r"CVE-\d{4}-\d{4,}", re.IGNORECASE)
 
 
 def severity_from_score(score: float) -> str:
@@ -128,7 +127,7 @@ def extract_cwes(containers: dict[str, Any]) -> list[str]:
                 cwes.add(cwe_id.upper())
             else:
                 text = str(desc.get("description") or "")
-                for match in re.findall(r"CWE-\d+", text, re.I):
+                for match in re.findall(r"CWE-\d+", text, re.IGNORECASE):
                     cwes.add(match.upper())
     return sorted(cwes)
 
@@ -491,7 +490,7 @@ def build_database(
     kev_count = conn.execute("SELECT COUNT(*) FROM cves WHERE is_kev = 1").fetchone()[0]
 
     meta_rows = [
-        ("built_at", datetime.now(timezone.utc).isoformat()),
+        ("built_at", datetime.now(UTC).isoformat()),
         ("min_cvss", str(min_cvss)),
         ("total_cves", str(total_cves)),
         ("total_writeups", str(total_writeups)),

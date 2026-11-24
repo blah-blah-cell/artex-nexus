@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 cve-intel-mcp: Dual-transport (stdio + Streamable HTTP / SSE) MCP server for
 querying all public Medium+ CVEs (CVSS >= 4.0), CISA KEV, EPSS, and public writeups.

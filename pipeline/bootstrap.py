@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 One-command bootstrap for the ARTEX-Nexus Medium+ CVE & Writeups SQLite DB.
 

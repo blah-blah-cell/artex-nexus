@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 scope-guard-mcp: Dual-transport (stdio + Streamable HTTP / SSE) MCP server for
 programmatic scope enforcement (allow/deny domain, wildcard, CIDR validation)
@@ -13,12 +12,13 @@ import hashlib
 import ipaddress
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import yaml
+
 from mcps.compat import create_mcp_server, run_mcp_server
 
 mcp = create_mcp_server("scope-guard-mcp")
@@ -168,7 +168,7 @@ def record_evidence_receipt(
         "verification_command": verification_command.strip(),
         "observed_output_summary": observed_output_summary.strip(),
         "remediation": remediation.strip(),
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "recorded_at": datetime.now(UTC).isoformat(),
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     payload["sha256"] = hashlib.sha256(canonical).hexdigest()
