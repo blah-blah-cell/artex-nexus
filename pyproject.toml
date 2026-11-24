@@ -1,0 +1,29 @@
+[project]
+name = "artex-nexus"
+version = "0.1.0"
+description = "Public cybersecurity research platform uniting all Medium+ CVEs & writeups, BaaRai/ARTEX, dual-transport MCP servers, and universal agent skills."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.2.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+compression = [
+    "zstandard>=0.23.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

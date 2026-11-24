@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "cve-intel-mcp": {
+      "command": "python",
+      "args": ["-m", "mcps.cve_intel_mcp.server", "--transport", "stdio"],
+      "env": {
+        "CVE_DB_PATH": "data/cve_kb_med_plus.sqlite"
+      }
+    },
+    "patch-diff-mcp": {
+      "command": "python",
+      "args": ["-m", "mcps.patch_diff_mcp.server", "--transport", "stdio"],
+      "env": {
+        "CVE_DB_PATH": "data/cve_kb_med_plus.sqlite"
+      }
+    },
+    "scope-guard-mcp": {
+      "command": "python",
+      "args": ["-m", "mcps.scope_guard_mcp.server", "--transport", "stdio"],
+      "env": {
+        "SCOPE_RECEIPT_DIR": "data/receipts"
+      }
+    }
+  },
+  "artexHttpServers": {
+    "cve-intel-mcp": "http://cve-intel-mcp:8901/mcp",
+    "patch-diff-mcp": "http://patch-diff-mcp:8902/mcp",
+    "scope-guard-mcp": "http://scope-guard-mcp:8903/mcp"
+  }
+}
