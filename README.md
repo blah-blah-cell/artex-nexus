@@ -1,5 +1,11 @@
 # ARTEX-Nexus
 
+[![CI](https://github.com/blah-blah-cell/artex-nexus/actions/workflows/ci.yml/badge.svg)](https://github.com/blah-blah-cell/artex-nexus/actions/workflows/ci.yml)
+[![Nightly CVE DB](https://github.com/blah-blah-cell/artex-nexus/actions/workflows/sync-cve-db.yml/badge.svg)](https://github.com/blah-blah-cell/artex-nexus/releases/tag/cve-db-latest)
+[![Rust](https://img.shields.io/badge/Rust-engine-orange?logo=rust)](crates/)
+[![Go](https://img.shields.io/badge/Go-MCP_services-00ADD8?logo=go)](go/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 **High-performance Rust + Go cybersecurity research platform uniting all public Medium+ CVEs, OSV/GHSA advisory writeups & package version ranges, [`BaaRai/ARTEX`](https://github.com/BaaRai/ARTEX), dual-transport native MCP servers, and universal agent instructions.**
 
 > **Authorized Use Only:** Designed strictly for authorized security research, bug bounty programs within declared scope, white-box auditing, and defensive engineering. See [SECURITY.md](SECURITY.md).
