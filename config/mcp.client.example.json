@@ -11,11 +11,16 @@
     "scope-guard-mcp": {
       "command": "./go/bin/scope-guard-mcp",
       "args": ["--transport", "stdio", "--config-dir", "config", "--state-dir", "data/receipts"]
+    },
+    "attack-surface-mcp": {
+      "command": "./go/bin/attack-surface-mcp",
+      "args": ["--transport", "stdio"]
     }
   },
   "artexHttpServers": {
     "cve-intel-mcp": "http://cve-intel-mcp:8901/mcp",
     "patch-diff-mcp": "http://patch-diff-mcp:8902/mcp",
-    "scope-guard-mcp": "http://scope-guard-mcp:8903/mcp"
+    "scope-guard-mcp": "http://scope-guard-mcp:8903/mcp",
+    "attack-surface-mcp": "http://attack-surface-mcp:8904/mcp"
   }
 }

@@ -1,26 +1,27 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::GzDecoder;
 use nexus_common::version::is_version_affected;
 use nexus_common::{
     AffectedProduct, CveRecord, PackageRange, SCHEMA_SQL, SCHEMA_VERSION, WriteupRecord,
-    detect_schema_version, open_readonly, severity_from_score,
+    detect_schema_version, open_readonly, sanitize_fts_query, severity_from_score,
 };
 use rayon::prelude::*;
 use regex::Regex;
 use reqwest::blocking::Client;
 use reqwest::header::{ETAG, IF_NONE_MATCH, USER_AGENT};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tiny_http::{Header, Method, Response, Server};
 use walkdir::WalkDir;
 
 const CISA_KEV_URL: &str =
@@ -29,10 +30,29 @@ const EPSS_CSV_GZ_URL: &str = "https://epss.empiricalsecurity.com/epss_scores-cu
 const DEFAULT_REPO: &str = "blah-blah-cell/artex-nexus";
 const DEFAULT_TAG: &str = "cve-db-latest";
 
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum SeverityThreshold {
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum McpClientKind {
+    Antigravity,
+    Claude,
+    Cursor,
+    Zcode,
+    Freebuff,
+    Artex,
+}
+
 #[derive(Parser)]
 #[command(
     name = "nexus-sync",
-    about = "High-throughput Rust CVE, OSV, KEV, EPSS & writeups DB builder and streaming fetcher"
+    about = "High-throughput Rust CVE, OSV, KEV, EPSS & writeups DB builder, scanner, web UI & fetcher"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -82,15 +102,35 @@ enum Command {
     },
     /// Offline SBOM/lockfile vulnerability scan against local OSV/GHSA Medium+ CVE ranges
     Scan {
-        #[arg(long, default_value = ".", help = "Target directory or lockfile (package-lock.json, package.json, requirements.txt, go.mod, Cargo.lock)")]
+        #[arg(long, default_value = ".", help = "Target directory or lockfile (10 formats supported)")]
         path: PathBuf,
         #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
         db: PathBuf,
         #[arg(long, help = "Output raw JSON instead of human-readable summary")]
         json: bool,
+        #[arg(long, help = "Write SARIF 2.1.0 report to this file")]
+        sarif: Option<PathBuf>,
+        #[arg(long, value_enum, help = "Exit non-zero if findings meet or exceed severity")]
+        fail_on: Option<SeverityThreshold>,
     },
     /// Run health, schema, integrity, and coverage diagnostics on the local ARTEX-Nexus DB
     Doctor {
+        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        db: PathBuf,
+    },
+    /// Generate ready-to-paste MCP client JSON config for Antigravity, ZCode, Freebuff, Claude, Cursor, or ARTEX
+    InitMcp {
+        #[arg(long, value_enum, default_value_t = McpClientKind::Antigravity)]
+        client: McpClientKind,
+        #[arg(long, default_value = ".")]
+        repo_root: PathBuf,
+    },
+    /// Launch local offline Web Dashboard for browsing CVEs, writeup text, and OSV SemVer checks
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8088)]
+        port: u16,
         #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
         db: PathBuf,
     },
@@ -1290,12 +1330,209 @@ fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)> {
                 }
             }
         }
+        "poetry.lock" => {
+            let mut cur_name = String::new();
+            for line in raw.lines() {
+                let l = line.trim();
+                if l == "[[package]]" {
+                    cur_name.clear();
+                } else if let Some(rest) = l.strip_prefix("name = \"") {
+                    cur_name = rest.trim_end_matches('"').to_string();
+                } else if let Some(rest) = l.strip_prefix("version = \"")
+                    && !cur_name.is_empty()
+                {
+                    deps.push((
+                        "PyPI".to_string(),
+                        cur_name.clone(),
+                        rest.trim_end_matches('"').to_string(),
+                    ));
+                }
+            }
+        }
+        "yarn.lock" => {
+            let mut cur_names: Vec<String> = Vec::new();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.ends_with(':') {
+                    cur_names.clear();
+                    for part in trimmed.trim_end_matches(':').split(',') {
+                        let spec = part.trim().trim_matches('"').trim_matches('\'');
+                        if spec.len() > 1
+                            && let Some(at_pos) = spec[1..].find('@')
+                        {
+                            let pkg = spec[..1 + at_pos].to_string();
+                            if !pkg.is_empty() && !cur_names.contains(&pkg) {
+                                cur_names.push(pkg);
+                            }
+                        }
+                    }
+                } else if !cur_names.is_empty() {
+                    let ver_opt = trimmed
+                        .strip_prefix("version \"")
+                        .map(|s| s.trim_end_matches('"'))
+                        .or_else(|| trimmed.strip_prefix("version:").map(str::trim));
+                    if let Some(ver) = ver_opt
+                        && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    {
+                        for name in &cur_names {
+                            deps.push(("npm".to_string(), name.clone(), ver.to_string()));
+                        }
+                        cur_names.clear();
+                    }
+                }
+            }
+        }
+        "pnpm-lock.yaml" => {
+            for line in raw.lines() {
+                let t = line.trim();
+                if !t.ends_with(':') {
+                    continue;
+                }
+                let cleaned = t
+                    .trim_end_matches(':')
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .trim_start_matches('/');
+                let no_peers = cleaned.split('(').next().unwrap_or(cleaned);
+                if no_peers.len() > 1
+                    && let Some(at_pos) = no_peers[1..].find('@')
+                {
+                    let name = &no_peers[..1 + at_pos];
+                    let ver = &no_peers[2 + at_pos..];
+                    if !name.is_empty()
+                        && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        && !ver.contains('/')
+                    {
+                        deps.push(("npm".to_string(), name.to_string(), ver.to_string()));
+                    }
+                }
+            }
+        }
+        "composer.lock" => {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                for key in ["packages", "packages-dev"] {
+                    if let Some(arr) = v.get(key).and_then(Value::as_array) {
+                        for pkg in arr {
+                            if let (Some(name), Some(ver)) = (
+                                pkg.get("name").and_then(Value::as_str),
+                                pkg.get("version").and_then(Value::as_str),
+                            ) {
+                                deps.push((
+                                    "Packagist".to_string(),
+                                    name.to_string(),
+                                    ver.trim_start_matches(['v', 'V']).to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        "pom.xml" => {
+            let dep_re = Regex::new(r"(?s)<dependency>(.*?)</dependency>").unwrap();
+            let gid_re = Regex::new(r"<groupId>\s*([^<\s]+)\s*</groupId>").unwrap();
+            let aid_re = Regex::new(r"<artifactId>\s*([^<\s]+)\s*</artifactId>").unwrap();
+            let ver_re = Regex::new(r"<version>\s*([^<\s]+)\s*</version>").unwrap();
+            for cap in dep_re.captures_iter(&raw) {
+                let block = &cap[1];
+                if let (Some(g), Some(a), Some(v)) =
+                    (gid_re.captures(block), aid_re.captures(block), ver_re.captures(block))
+                {
+                    let ver = v[1].trim();
+                    if !ver.starts_with('$') && !ver.is_empty() {
+                        deps.push((
+                            "Maven".to_string(),
+                            format!("{}:{}", g[1].trim(), a[1].trim()),
+                            ver.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
         _ => {}
     }
     deps
 }
 
-fn cmd_scan(path: &Path, db_path: &Path, as_json: bool) -> Result<()> {
+fn build_sarif_report(findings: &[Value]) -> Value {
+    let results: Vec<Value> = findings
+        .iter()
+        .map(|f| {
+            let sev = f["severity"].as_str().unwrap_or("MEDIUM");
+            let is_kev = f["is_kev"].as_bool().unwrap_or(false);
+            let level = if sev == "CRITICAL" || sev == "HIGH" || sev == "KEV_UNSCORED" || is_kev {
+                "error"
+            } else {
+                "warning"
+            };
+            let pkg = f["package"].as_str().unwrap_or("");
+            let inst = f["installed"].as_str().unwrap_or("");
+            let eco = f["ecosystem"].as_str().unwrap_or("");
+            let fixed = f["fixed"].as_str().unwrap_or("none");
+            let cve_id = f["cve_id"].as_str().unwrap_or("CVE-UNKNOWN");
+            let title = f["title"].as_str().unwrap_or("");
+            let manifest = f["file"].as_str().unwrap_or("lockfile");
+            json!({
+                "ruleId": cve_id,
+                "level": level,
+                "message": {
+                    "text": format!("{pkg}@{inst} ({eco}) affected by {cve_id} (fix: {fixed}) — {title}")
+                },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": manifest.replace('\\', "/") }
+                    }
+                }],
+                "properties": {
+                    "advisory_id": f["advisory_id"],
+                    "ecosystem": eco,
+                    "package": pkg,
+                    "installed": inst,
+                    "fixed": fixed,
+                    "cvss_score": f["cvss_score"],
+                    "severity": sev,
+                    "is_kev": is_kev,
+                    "epss_score": f["epss_score"]
+                }
+            })
+        })
+        .collect();
+
+    json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "artex-nexus-sbom-scanner",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://github.com/blah-blah-cell/artex-nexus"
+                }
+            },
+            "results": results
+        }]
+    })
+}
+
+fn severity_rank(sev: &str, is_kev: bool) -> u8 {
+    match sev {
+        "CRITICAL" => 3,
+        "HIGH" | "KEV_UNSCORED" => 2,
+        "MEDIUM" => 1,
+        _ => if is_kev { 2 } else { 0 },
+    }
+}
+
+fn cmd_scan(
+    path: &Path,
+    db_path: &Path,
+    as_json: bool,
+    sarif_out: Option<&Path>,
+    fail_on: Option<SeverityThreshold>,
+) -> Result<()> {
     let start = Instant::now();
     let conn = open_readonly(db_path)?;
     if detect_schema_version(&conn) < 2 {
@@ -1319,7 +1556,18 @@ fn cmd_scan(path: &Path, db_path: &Path, as_json: bool) -> Result<()> {
                 e.file_type().is_file()
                     && matches!(
                         e.file_name().to_str(),
-                        Some("package-lock.json" | "package.json" | "requirements.txt" | "go.mod" | "Cargo.lock")
+                        Some(
+                            "package-lock.json"
+                                | "package.json"
+                                | "yarn.lock"
+                                | "pnpm-lock.yaml"
+                                | "requirements.txt"
+                                | "poetry.lock"
+                                | "go.mod"
+                                | "Cargo.lock"
+                                | "composer.lock"
+                                | "pom.xml"
+                        )
                     )
             })
             .map(|e| e.into_path())
@@ -1378,6 +1626,17 @@ fn cmd_scan(path: &Path, db_path: &Path, as_json: bool) -> Result<()> {
         }
     }
 
+    if let Some(sarif_path) = sarif_out {
+        if let Some(parent) = sarif_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let sarif_doc = build_sarif_report(&findings);
+        fs::write(sarif_path, serde_json::to_string_pretty(&sarif_doc)?)?;
+        eprintln!("[+] SARIF 2.1.0 report written to {}", sarif_path.display());
+    }
+
     let report = serde_json::json!({
         "manifests_scanned": targets.len(),
         "dependencies_checked": deps_checked,
@@ -1409,6 +1668,26 @@ fn cmd_scan(path: &Path, db_path: &Path, as_json: bool) -> Result<()> {
                 f["cve_id"].as_str().unwrap_or(""),
                 f["advisory_id"].as_str().unwrap_or("")
             );
+        }
+    }
+
+    if let Some(threshold) = fail_on {
+        let min_rank = match threshold {
+            SeverityThreshold::Medium => 1,
+            SeverityThreshold::High => 2,
+            SeverityThreshold::Critical => 3,
+        };
+        let failing = findings
+            .iter()
+            .filter(|f| {
+                severity_rank(
+                    f["severity"].as_str().unwrap_or("NONE"),
+                    f["is_kev"].as_bool().unwrap_or(false),
+                ) >= min_rank
+            })
+            .count();
+        if failing > 0 {
+            anyhow::bail!("{failing} findings met or exceeded --fail-on threshold ({threshold:?})");
         }
     }
     Ok(())
@@ -1452,6 +1731,499 @@ fn cmd_doctor(db_path: &Path) -> Result<()> {
             "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0
         }))?
     );
+    Ok(())
+}
+
+fn clean_abs_path(p: &Path) -> PathBuf {
+    let abs = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = abs.to_string_lossy();
+    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+}
+
+fn cmd_init_mcp(client: McpClientKind, repo_root: &Path) -> Result<()> {
+    if client == McpClientKind::Artex {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "artexHttpServers": {
+                    "cve-intel-mcp": "http://cve-intel-mcp:8901/mcp",
+                    "patch-diff-mcp": "http://patch-diff-mcp:8902/mcp",
+                    "scope-guard-mcp": "http://scope-guard-mcp:8903/mcp",
+                    "attack-surface-mcp": "http://attack-surface-mcp:8904/mcp"
+                }
+            }))?
+        );
+        return Ok(());
+    }
+
+    let root = clean_abs_path(repo_root);
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let cve_bin = root.join("target").join("release").join(format!("cve-intel-mcp{ext}"));
+    let patch_bin = root.join("go").join("bin").join(format!("patch-diff-mcp{ext}"));
+    let scope_bin = root.join("go").join("bin").join(format!("scope-guard-mcp{ext}"));
+    let surface_bin = root.join("go").join("bin").join(format!("attack-surface-mcp{ext}"));
+    let db_path = root.join("data").join("cve_kb_med_plus.sqlite");
+    let cfg_dir = root.join("config");
+    let state_dir = root.join("data").join("receipts");
+
+    let output = if client == McpClientKind::Zcode {
+        json!({
+            "mcp": {
+                "servers": {
+                    "cve-intel-mcp": {
+                        "type": "stdio",
+                        "command": cve_bin,
+                        "args": ["--transport", "stdio", "--db-path", db_path],
+                        "timeoutMs": 30000
+                    },
+                    "patch-diff-mcp": {
+                        "type": "stdio",
+                        "command": patch_bin,
+                        "args": ["--transport", "stdio"],
+                        "timeoutMs": 30000
+                    },
+                    "scope-guard-mcp": {
+                        "type": "stdio",
+                        "command": scope_bin,
+                        "args": ["--transport", "stdio", "--config-dir", cfg_dir, "--state-dir", state_dir],
+                        "timeoutMs": 30000
+                    },
+                    "attack-surface-mcp": {
+                        "type": "stdio",
+                        "command": surface_bin,
+                        "args": ["--transport", "stdio"],
+                        "timeoutMs": 30000
+                    }
+                }
+            }
+        })
+    } else {
+        json!({
+            "mcpServers": {
+                "cve-intel-mcp": {
+                    "command": cve_bin,
+                    "args": ["--transport", "stdio", "--db-path", db_path]
+                },
+                "patch-diff-mcp": {
+                    "command": patch_bin,
+                    "args": ["--transport", "stdio"]
+                },
+                "scope-guard-mcp": {
+                    "command": scope_bin,
+                    "args": ["--transport", "stdio", "--config-dir", cfg_dir, "--state-dir", state_dir]
+                },
+                "attack-surface-mcp": {
+                    "command": surface_bin,
+                    "args": ["--transport", "stdio"]
+                }
+            }
+        })
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    && let Ok(val) = u8::from_str_radix(hex_str, 16)
+                {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+                out.push(b'%');
+                i += 1;
+            }
+            ch => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_query_params(url: &str) -> (&str, HashMap<String, String>) {
+    let Some((path, qs)) = url.split_once('?') else {
+        return (url, HashMap::new());
+    };
+    let mut map = HashMap::new();
+    for pair in qs.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        map.insert(percent_decode(k), percent_decode(v));
+    }
+    (path, map)
+}
+
+fn api_stats(db_path: &Path) -> Result<Value> {
+    let conn = open_readonly(db_path)?;
+    let schema = detect_schema_version(&conn);
+    let mut meta = serde_json::Map::new();
+    let mut stmt = conn.prepare("SELECT key, value FROM metadata")?;
+    for (k, v) in stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .flatten()
+    {
+        meta.insert(k, json!(v));
+    }
+    let mut by_sev = serde_json::Map::new();
+    let mut sev_stmt = conn.prepare("SELECT cvss_severity, COUNT(*) FROM cves GROUP BY cvss_severity")?;
+    for (k, v) in sev_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .flatten()
+    {
+        by_sev.insert(k, json!(v));
+    }
+    let mut by_maturity = serde_json::Map::new();
+    if schema >= 2 {
+        let mut mat_stmt =
+            conn.prepare("SELECT exploit_maturity, COUNT(*) FROM cves GROUP BY exploit_maturity")?;
+        for (k, v) in mat_stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .flatten()
+        {
+            by_maturity.insert(k, json!(v));
+        }
+    }
+    Ok(json!({
+        "schema_version": schema,
+        "metadata": meta,
+        "by_severity": by_sev,
+        "by_exploit_maturity": by_maturity
+    }))
+}
+
+fn api_search(db_path: &Path, params: &HashMap<String, String>) -> Result<Value> {
+    let start = Instant::now();
+    let q = params.get("q").map(String::as_str).unwrap_or("");
+    let mode = params.get("mode").map(String::as_str).unwrap_or("cves");
+    let fts_q = sanitize_fts_query(q);
+    if fts_q.is_empty() {
+        return Ok(json!({"error": "Provide a non-empty search query."}));
+    }
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 100);
+    let conn = open_readonly(db_path)?;
+    let schema = detect_schema_version(&conn);
+
+    if mode == "writeups" {
+        if schema < 2 {
+            return Ok(json!({"error": "Writeup full-text search requires schema v2 DB."}));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT w.cve_id, c.cvss_score, c.cvss_severity, c.is_kev, w.source, w.url, w.title,
+                    substr(w.content_excerpt, 1, 320)
+             FROM writeups_fts wf
+             JOIN writeups w ON w.id = wf.rowid
+             JOIN cves c ON c.cve_id = w.cve_id
+             WHERE writeups_fts MATCH ?1
+             ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC
+             LIMIT ?2",
+        )?;
+        let rows: Vec<Value> = stmt
+            .query_map(params![fts_q, limit], |r| {
+                Ok(json!({
+                    "cve_id": r.get::<_, String>(0)?,
+                    "cvss_score": r.get::<_, Option<f64>>(1)?,
+                    "cvss_severity": r.get::<_, String>(2)?,
+                    "is_kev": r.get::<_, i64>(3)? == 1,
+                    "source": r.get::<_, String>(4)?,
+                    "url": r.get::<_, String>(5)?,
+                    "title": r.get::<_, String>(6)?,
+                    "excerpt": r.get::<_, String>(7)?
+                }))
+            })?
+            .flatten()
+            .collect();
+        return Ok(json!({
+            "query": q,
+            "mode": "writeups",
+            "count": rows.len(),
+            "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
+            "results": rows
+        }));
+    }
+
+    let min_cvss = params
+        .get("min_cvss")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(4.0)
+        .max(4.0);
+    let kev_only = params
+        .get("kev")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let cwe_opt = params
+        .get("cwe")
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .map(|s| if s.starts_with("CWE-") { s } else { format!("CWE-{s}") });
+
+    let maturity_col = if schema >= 2 {
+        "c.exploit_maturity"
+    } else {
+        "CASE WHEN c.is_kev = 1 THEN 'KEV_EXPLOITED' ELSE 'NONE' END"
+    };
+    let mut sql = format!(
+        "SELECT c.cve_id, c.title, c.cvss_score, c.cvss_severity, c.is_kev, {maturity_col},
+                substr(c.description, 1, 260)
+         FROM cves_fts f
+         JOIN cves c ON c.rowid = f.rowid
+         WHERE cves_fts MATCH ?
+           AND (c.cvss_score >= ? OR (c.cvss_score IS NULL AND c.is_kev = 1))"
+    );
+    let mut sql_params: Vec<rusqlite::types::Value> = vec![fts_q.into(), min_cvss.into()];
+
+    if let Some(cwe_id) = cwe_opt {
+        if schema >= 2 {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM cve_cwes cc WHERE cc.cve_id = c.cve_id AND cc.cwe_id = ?)");
+            sql_params.push(cwe_id.into());
+        } else {
+            sql.push_str(" AND (',' || UPPER(c.cwe_ids) || ',') LIKE ?");
+            sql_params.push(format!("%,{cwe_id},%").into());
+        }
+    }
+    if kev_only {
+        sql.push_str(" AND c.is_kev = 1");
+    }
+    sql.push_str(" ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC, COALESCE(c.epss_score, 0.0) DESC LIMIT ?");
+    sql_params.push(limit.into());
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map(params_from_iter(sql_params.iter()), |r| {
+            Ok(json!({
+                "cve_id": r.get::<_, String>(0)?,
+                "title": r.get::<_, String>(1)?,
+                "cvss_score": r.get::<_, Option<f64>>(2)?,
+                "cvss_severity": r.get::<_, String>(3)?,
+                "is_kev": r.get::<_, i64>(4)? == 1,
+                "exploit_maturity": r.get::<_, String>(5)?,
+                "summary": r.get::<_, String>(6)?
+            }))
+        })?
+        .flatten()
+        .collect();
+
+    Ok(json!({
+        "query": q,
+        "mode": "cves",
+        "count": rows.len(),
+        "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
+        "results": rows
+    }))
+}
+
+fn api_cve_detail(db_path: &Path, raw_id: &str) -> Result<Value> {
+    let cid = percent_decode(raw_id).trim().to_uppercase();
+    let conn = open_readonly(db_path)?;
+    let schema = detect_schema_version(&conn);
+    let maturity_col = if schema >= 2 {
+        "exploit_maturity"
+    } else {
+        "CASE WHEN is_kev = 1 THEN 'KEV_EXPLOITED' ELSE 'NONE' END"
+    };
+    let sql = format!(
+        "SELECT cve_id, published_date, modified_date, cvss_score, cvss_severity, cvss_vector,
+                epss_score, is_kev, {maturity_col}, title, description
+         FROM cves WHERE cve_id = ?1"
+    );
+    let mut record = match conn.query_row(&sql, [&cid], |r| {
+        Ok(json!({
+            "found": true,
+            "cve_id": r.get::<_, String>(0)?,
+            "published_date": r.get::<_, String>(1)?,
+            "modified_date": r.get::<_, String>(2)?,
+            "cvss_score": r.get::<_, Option<f64>>(3)?,
+            "cvss_severity": r.get::<_, String>(4)?,
+            "cvss_vector": r.get::<_, String>(5)?,
+            "epss_score": r.get::<_, Option<f64>>(6)?,
+            "is_kev": r.get::<_, i64>(7)? == 1,
+            "exploit_maturity": r.get::<_, String>(8)?,
+            "title": r.get::<_, String>(9)?,
+            "description": r.get::<_, String>(10)?
+        }))
+    }) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(json!({"found": false, "cve_id": cid})),
+        Err(e) => return Err(e.into()),
+    };
+
+    if schema >= 2 {
+        let mut cwe_stmt = conn.prepare("SELECT cwe_id FROM cve_cwes WHERE cve_id = ?1 ORDER BY cwe_id")?;
+        let cwes: Vec<String> = cwe_stmt
+            .query_map([&cid], |r| r.get::<_, String>(0))?
+            .flatten()
+            .collect();
+        record["cwes"] = json!(cwes);
+
+        let mut pkg_stmt = conn.prepare(
+            "SELECT ecosystem, package_name, introduced_ver, fixed_ver, advisory_id
+             FROM cve_packages WHERE cve_id = ?1 ORDER BY ecosystem, package_name",
+        )?;
+        let pkgs: Vec<Value> = pkg_stmt
+            .query_map([&cid], |r| {
+                Ok(json!({
+                    "ecosystem": r.get::<_, String>(0)?,
+                    "package_name": r.get::<_, String>(1)?,
+                    "introduced_ver": r.get::<_, String>(2)?,
+                    "fixed_ver": r.get::<_, String>(3)?,
+                    "advisory_id": r.get::<_, String>(4)?
+                }))
+            })?
+            .flatten()
+            .collect();
+        record["packages"] = json!(pkgs);
+    }
+
+    let excerpt_col = if schema >= 2 { "content_excerpt" } else { "''" };
+    let wu_sql = format!(
+        "SELECT source, url, title, has_patch_diff, {excerpt_col}
+         FROM writeups WHERE cve_id = ?1
+         ORDER BY length({excerpt_col}) DESC, has_patch_diff DESC LIMIT 50"
+    );
+    let mut wu_stmt = conn.prepare(&wu_sql)?;
+    let writeups: Vec<Value> = wu_stmt
+        .query_map([&cid], |r| {
+            Ok(json!({
+                "source": r.get::<_, String>(0)?,
+                "url": r.get::<_, String>(1)?,
+                "title": r.get::<_, String>(2)?,
+                "has_patch_diff": r.get::<_, i64>(3)? == 1,
+                "content_excerpt": r.get::<_, String>(4)?
+            }))
+        })?
+        .flatten()
+        .collect();
+    record["writeups"] = json!(writeups);
+    Ok(record)
+}
+
+fn api_package_check(db_path: &Path, params: &HashMap<String, String>) -> Result<Value> {
+    let start = Instant::now();
+    let eco = params.get("ecosystem").map(String::as_str).unwrap_or("").trim();
+    let name = params.get("name").map(String::as_str).unwrap_or("").trim();
+    let ver = params.get("version").map(String::as_str).unwrap_or("").trim();
+    if eco.is_empty() || name.is_empty() || ver.is_empty() {
+        return Ok(json!({"error": "ecosystem, name, and version are required."}));
+    }
+    let conn = open_readonly(db_path)?;
+    if detect_schema_version(&conn) < 2 {
+        return Ok(json!({"error": "Package checking requires schema v2 DB."}));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT p.cve_id, p.introduced_ver, p.fixed_ver, p.advisory_id,
+                c.cvss_score, c.cvss_severity, c.is_kev, c.title
+         FROM cve_packages p
+         JOIN cves c ON c.cve_id = p.cve_id
+         WHERE LOWER(p.ecosystem) = LOWER(?1) AND LOWER(p.package_name) = LOWER(?2)
+         ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC",
+    )?;
+    let rows = stmt.query_map(params![eco, name], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<f64>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, i64>(6)? == 1,
+            r.get::<_, String>(7)?,
+        ))
+    })?;
+    let mut vulns = Vec::new();
+    for (cve_id, intro, fixed, adv, score, sev, is_kev, title) in rows.flatten() {
+        if is_version_affected(ver, &intro, &fixed) == Some(true) {
+            vulns.push(json!({
+                "cve_id": cve_id,
+                "advisory_id": adv,
+                "introduced_ver": intro,
+                "fixed_ver": fixed,
+                "cvss_score": score,
+                "cvss_severity": sev,
+                "is_kev": is_kev,
+                "title": title
+            }));
+        }
+    }
+    Ok(json!({
+        "ecosystem": eco,
+        "package_name": name,
+        "installed_version": ver,
+        "vulnerable": !vulns.is_empty(),
+        "count": vulns.len(),
+        "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
+        "vulnerabilities": vulns
+    }))
+}
+
+fn json_response(status: u16, body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    let hdr = Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap();
+    Response::from_string(body.to_string())
+        .with_status_code(status)
+        .with_header(hdr)
+}
+
+fn serve_dashboard(server: Arc<Server>, db_path: PathBuf) {
+    for request in server.incoming_requests() {
+        if *request.method() != Method::Get {
+            let _ = request.respond(Response::from_string("Method Not Allowed").with_status_code(405));
+            continue;
+        }
+        let full_url = request.url().to_string();
+        let (path, qparams) = parse_query_params(&full_url);
+        let resp = match path {
+            "/" | "/index.html" => {
+                let hdr = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
+                Response::from_string(DASHBOARD_HTML).with_header(hdr)
+            }
+            "/api/stats" => match api_stats(&db_path) {
+                Ok(v) => json_response(200, v),
+                Err(e) => json_response(500, json!({"error": e.to_string()})),
+            },
+            "/api/search" => match api_search(&db_path, &qparams) {
+                Ok(v) => json_response(200, v),
+                Err(e) => json_response(500, json!({"error": e.to_string()})),
+            },
+            "/api/package" => match api_package_check(&db_path, &qparams) {
+                Ok(v) => json_response(200, v),
+                Err(e) => json_response(500, json!({"error": e.to_string()})),
+            },
+            p if p.starts_with("/api/cve/") => {
+                let cid = p.trim_start_matches("/api/cve/");
+                match api_cve_detail(&db_path, cid) {
+                    Ok(v) => json_response(200, v),
+                    Err(e) => json_response(500, json!({"error": e.to_string()})),
+                }
+            }
+            _ => Response::from_string("Not Found").with_status_code(404),
+        };
+        let _ = request.respond(resp);
+    }
+}
+
+fn cmd_serve(host: &str, port: u16, db_path: PathBuf) -> Result<()> {
+    let _ = open_readonly(&db_path)?;
+    let addr = format!("{host}:{port}");
+    let server = Arc::new(Server::http(&addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?);
+    eprintln!("[+] ARTEX-Nexus Offline Web Console listening on http://{addr}");
+    serve_dashboard(server, db_path);
     Ok(())
 }
 
@@ -1536,8 +2308,16 @@ fn main() -> Result<()> {
             force,
         } => cmd_fetch(&repo, &tag, &out, force)?,
         Command::SeedKev { out } => cmd_seed_kev(&out)?,
-        Command::Scan { path, db, json } => cmd_scan(&path, &db, json)?,
+        Command::Scan {
+            path,
+            db,
+            json,
+            sarif,
+            fail_on,
+        } => cmd_scan(&path, &db, json, sarif.as_deref(), fail_on)?,
         Command::Doctor { db } => cmd_doctor(&db)?,
+        Command::InitMcp { client, repo_root } => cmd_init_mcp(client, &repo_root)?,
+        Command::Serve { host, port, db } => cmd_serve(&host, port, db)?,
     }
     Ok(())
 }
@@ -1653,5 +2433,141 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wu_hit, "CVE-2026-1000");
+    }
+
+    #[test]
+    fn parses_new_lockfile_formats_and_builds_sarif() {
+        let dir = tempdir().unwrap();
+
+        let yarn = dir.path().join("yarn.lock");
+        fs::write(
+            &yarn,
+            "\"@babel/core@^7.0.0\":\n  version \"7.24.0\"\n\n\"lodash@^4.17.15\", lodash@^4.17.20:\n  version \"4.17.15\"\n",
+        )
+        .unwrap();
+        let yarn_deps = parse_dependencies_from_file(&yarn);
+        assert!(yarn_deps.contains(&("npm".to_string(), "@babel/core".to_string(), "7.24.0".to_string())));
+        assert!(yarn_deps.contains(&("npm".to_string(), "lodash".to_string(), "4.17.15".to_string())));
+
+        let pnpm = dir.path().join("pnpm-lock.yaml");
+        fs::write(&pnpm, "packages:\n  '/lodash@4.17.15':\n  '@scope/pkg@1.2.3(react@18.0.0)':\n").unwrap();
+        let pnpm_deps = parse_dependencies_from_file(&pnpm);
+        assert!(pnpm_deps.contains(&("npm".to_string(), "lodash".to_string(), "4.17.15".to_string())));
+        assert!(pnpm_deps.contains(&("npm".to_string(), "@scope/pkg".to_string(), "1.2.3".to_string())));
+
+        let poetry = dir.path().join("poetry.lock");
+        fs::write(&poetry, "[[package]]\nname = \"requests\"\nversion = \"2.31.0\"\n").unwrap();
+        assert_eq!(
+            parse_dependencies_from_file(&poetry),
+            vec![("PyPI".to_string(), "requests".to_string(), "2.31.0".to_string())]
+        );
+
+        let composer = dir.path().join("composer.lock");
+        fs::write(&composer, r#"{"packages":[{"name":"symfony/http-kernel","version":"v6.4.0"}]}"#).unwrap();
+        assert_eq!(
+            parse_dependencies_from_file(&composer),
+            vec![("Packagist".to_string(), "symfony/http-kernel".to_string(), "6.4.0".to_string())]
+        );
+
+        let pom = dir.path().join("pom.xml");
+        fs::write(
+            &pom,
+            "<dependencies><dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>2.14.1</version></dependency></dependencies>",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_dependencies_from_file(&pom),
+            vec![("Maven".to_string(), "org.apache.logging.log4j:log4j-core".to_string(), "2.14.1".to_string())]
+        );
+
+        let sarif = build_sarif_report(&[json!({
+            "file": "package-lock.json",
+            "ecosystem": "npm",
+            "package": "lodash",
+            "installed": "4.17.15",
+            "fixed": "4.17.21",
+            "cve_id": "CVE-2021-23337",
+            "advisory_id": "GHSA-35jh-r3h4-6jhm",
+            "cvss_score": 7.2,
+            "severity": "HIGH",
+            "is_kev": false,
+            "epss_score": 0.2,
+            "title": "Command Injection"
+        })]);
+        assert_eq!(sarif["version"], "2.1.0");
+        assert_eq!(sarif["runs"][0]["results"][0]["ruleId"], "CVE-2021-23337");
+        assert_eq!(sarif["runs"][0]["results"][0]["level"], "error");
+    }
+
+    #[test]
+    fn dashboard_http_endpoints_work() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("dash.sqlite");
+        let osv_dir = dir.path().join("osv");
+        fs::create_dir_all(&osv_dir).unwrap();
+        fs::write(
+            osv_dir.join("GHSA-dash-0001.json"),
+            serde_json::json!({
+                "id": "GHSA-dash-0001",
+                "aliases": ["CVE-2026-2000"],
+                "summary": "Demo SSRF in lodash-demo",
+                "details": "Detailed SSRF writeup body.",
+                "affected": [{
+                    "package": {"ecosystem": "npm", "name": "lodash-demo"},
+                    "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "4.17.21"}]}]
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let r1 = parse_cve5_value(
+            &sample_cve("CVE-2026-2000", Some(9.1), "CWE-79", "PUBLISHED"),
+            &HashMap::new(),
+            &HashMap::new(),
+            4.0,
+        )
+        .unwrap();
+        write_records_to_db(&db, &[r1], 4.0, None, None, Some(&osv_dir)).unwrap();
+
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_ip().unwrap();
+        let srv_clone = Arc::clone(&server);
+        let db_clone = db.clone();
+        std::thread::spawn(move || serve_dashboard(srv_clone, db_clone));
+
+        let client = Client::new();
+        let html = client.get(format!("http://{addr}/")).send().unwrap().text().unwrap();
+        assert!(html.contains("ARTEX-"));
+
+        let stats: Value = client.get(format!("http://{addr}/api/stats")).send().unwrap().json().unwrap();
+        assert_eq!(stats["metadata"]["total_cves"], "1");
+
+        let search: Value = client
+            .get(format!("http://{addr}/api/search?q=AcmeProxy%20SSRF&cwe=CWE-79"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(search["count"], 1);
+        assert_eq!(search["results"][0]["cve_id"], "CVE-2026-2000");
+
+        let detail: Value = client
+            .get(format!("http://{addr}/api/cve/CVE-2026-2000"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(detail["found"], true);
+
+        let pkg: Value = client
+            .get(format!("http://{addr}/api/package?ecosystem=npm&name=lodash-demo&version=4.17.15"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(pkg["vulnerable"], true);
+        assert_eq!(pkg["count"], 1);
+
+        server.unblock();
     }
 }

@@ -43,13 +43,14 @@ flowchart TB
     IDE["AI Coding Agents\n(Antigravity / ZCode / Freebuff / Claude / Cursor)"]
 
     subgraph Rust["Rust Engine (Cargo Workspace)"]
-        SYNC["nexus-sync\nRayon Builder · ETag Fetcher · Offline SBOM Scan · Doctor"]
+        SYNC["nexus-sync\nRayon Builder · ETag Fetcher · SARIF SBOM Scan · Offline Web UI"]
         CVE["cve-intel-mcp (:8901)\n9 Tools: Dual-FTS5 CVEs, Writeups, SemVer OSV, Exact CWEs"]
     end
 
     subgraph Go["Go Hardened Services (CGO_ENABLED=0)"]
         PATCH["patch-diff-mcp (:8902)\nSSRF-Proof No-Redirect Diff Analyzer"]
         SCOPE["scope-guard-mcp (:8903)\nConfined Per-Task Scope + Hash-Chained Ledger"]
+        SURFACE["attack-surface-mcp (:8904)\nOpenAPI Auditor · CWE Sinks · JWT/Headers"]
     end
 
     DB[("data/cve_kb_med_plus.sqlite\nv2 SQLite + Dual FTS5")]
@@ -59,10 +60,12 @@ flowchart TB
     ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> CVE
     ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> PATCH
     ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> SCOPE
+    ARTEX -- "mcphttp (Streamable HTTP /mcp)" --> SURFACE
     ARTEX -- "ARTEX_SKILL_DIR" --> SKILLS
     IDE -- "stdio JSON-RPC 2.0" --> CVE
     IDE -- "stdio JSON-RPC 2.0" --> PATCH
     IDE -- "stdio JSON-RPC 2.0" --> SCOPE
+    IDE -- "stdio JSON-RPC 2.0" --> SURFACE
     CVE --> DB
 ```
 
@@ -70,9 +73,11 @@ flowchart TB
 
 ## Features & Components
 
-1. **Rust Ingestion, Streaming Fetcher & Offline SBOM Scanner (`crates/nexus-sync`)**
+1. **Rust Ingestion, Streaming Fetcher, Offline Web UI & SBOM Scanner (`crates/nexus-sync`)**
    - `nexus-sync fetch`: HTTP ETag caching (`304 Not Modified`), streaming download with on-the-fly SHA-256 verification, streaming Zstd decompression, `PRAGMA quick_check`, and atomic swap.
-   - `nexus-sync scan --path <dir-or-lockfile>`: Offline SemVer/OSV vulnerability scanner supporting `package-lock.json`, `package.json`, `requirements.txt`, `go.mod`, and `Cargo.lock`.
+   - `nexus-sync serve --port 8088`: Built-in zero-dependency **Offline CVE/OSV Web Console** (`http://127.0.0.1:8088`) to search all 227k+ CVEs, 21k+ writeups, and test SemVer package ranges in your browser.
+   - `nexus-sync scan --path <dir-or-lockfile> --sarif out.sarif --fail-on high`: Offline SemVer/OSV vulnerability scanner & CI gate supporting **10 formats** (`package-lock.json`, `package.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `poetry.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `pom.xml`) with **SARIF 2.1.0** export.
+   - `nexus-sync init-mcp --client <antigravity|claude|cursor|zcode|freebuff|artex>`: Generates ready-to-paste MCP client JSON configs for all 4 servers.
    - `nexus-sync doctor`: Instant DB integrity, schema version, and coverage diagnostics.
    - `nexus-sync build`: Multi-threaded `rayon` ingestion of `CVEProject/cvelistV5`, CISA KEV, FIRST EPSS, `github/advisory-database` (OSV/GHSA), `trickest/cve`, and `nuclei-templates` — zero fabricated CVSS scores (`NULL` + `KEV_UNSCORED`).
 2. **Rust Native `cve-intel-mcp` (`crates/cve-intel-mcp`, 9 MCP Tools)**
@@ -82,7 +87,11 @@ flowchart TB
    - Direct `api.github.com` diff endpoint (`Accept: application/vnd.github.diff`), **all HTTP redirects refused**, and DNS-resolving `DialContext` blocking loopback, RFC1918, CGNAT, and cloud metadata IPs (`169.254.169.254`).
 4. **Go Hardened `scope-guard-mcp` (`go/cmd/scope-guard-mcp`)**
    - Symlink-safe `SCOPE_CONFIG_DIR` confinement, multi-tenant persisted `scope_id` isolation, and a cryptographically hash-chained append-only ledger (`receipts.jsonl`) verified by `verify_ledger_chain` and exportable to Markdown or SARIF 2.1.0.
-5. **Universal Skills, Playbooks & `BaaRai/ARTEX` Stack**
+5. **Go Offline `attack-surface-mcp` (`go/cmd/attack-surface-mcp`, 3 MCP Tools)**
+   - `audit_openapi_spec`: Flags unauthenticated writes (`CWE-306`), BOLA/IDOR object IDs (`CWE-639`), SSRF params (`CWE-918`), and mass-assignment fields (`CWE-915`).
+   - `scan_source_sinks`: Static CWE sink & hardcoded secret scan mapped directly to `cve-intel-mcp:list_cwe_writeups`.
+   - `inspect_jwt_and_headers`: Offline JWT (`alg=none`, `jku`/`x5u`/`kid`, missing `exp`) and CORS/CSP/`Set-Cookie` auditing.
+6. **Universal Skills, Playbooks & `BaaRai/ARTEX` Stack**
    - Modular skills (`skills/*/SKILL.md`), CWE & Web/API playbooks (`knowledge/playbooks/`), CNA disclosure template (`knowledge/templates/`), and unified `docker-compose.yml` mounting `vendor/ARTEX`.
 
 ---
@@ -95,14 +104,17 @@ git clone --recurse-submodules https://github.com/blah-blah-cell/artex-nexus.git
 cd artex-nexus
 ```
 
-### 2. Build native binaries, fetch the CVE/OSV DB & verify health
+### 2. Build native binaries, fetch the CVE/OSV DB & launch the Offline Web Console
 ```bash
 make build
 ./target/release/nexus-sync fetch
 ./target/release/nexus-sync doctor
 
-# Offline dependency scan on any repo or lockfile
-./target/release/nexus-sync scan --path .
+# Launch local offline Web Console at http://127.0.0.1:8088
+./target/release/nexus-sync serve
+
+# Offline dependency scan (10 lockfile formats) + SARIF export + CI gate
+./target/release/nexus-sync scan --path . --sarif sbom.sarif --fail-on high
 ```
 
 ### 3. Launch `BaaRai/ARTEX` + Native MCP HTTP Stack
@@ -115,9 +127,13 @@ docker compose up -d --build
   - `http://cve-intel-mcp:8901/mcp`
   - `http://patch-diff-mcp:8902/mcp`
   - `http://scope-guard-mcp:8903/mcp`
+  - `http://attack-surface-mcp:8904/mcp`
 
 ### 4. Connect to IDE Agents (`stdio` MCP)
-Copy the server entries from [`config/mcp.client.example.json`](config/mcp.client.example.json) into Antigravity, ZCode, Freebuff, Claude Code, or Cursor.
+Generate config automatically for your client (or copy [`config/mcp.client.example.json`](config/mcp.client.example.json)):
+```bash
+./target/release/nexus-sync init-mcp --client antigravity   # or claude | cursor | zcode | freebuff | artex
+```
 
 ---
 

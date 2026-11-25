@@ -27,6 +27,8 @@ services:
         condition: service_started
       scope-guard-mcp:
         condition: service_started
+      attack-surface-mcp:
+        condition: service_started
     ports:
       - "${ARTEX_PORT:-8787}:8787"
     environment:
@@ -69,6 +71,15 @@ services:
     volumes:
       - ./data:/data
       - ./config:/config:ro
+
+  attack-surface-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["attack-surface-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8904"]
+    ports:
+      - "127.0.0.1:8904:8904"
 
 volumes:
   artex_pgdata:

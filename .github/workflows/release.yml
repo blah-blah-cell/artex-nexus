@@ -59,6 +59,7 @@ jobs:
           mkdir -p bin
           go build -trimpath -ldflags="-s -w" -o "bin/patch-diff-mcp${{ matrix.ext }}" ./cmd/patch-diff-mcp
           go build -trimpath -ldflags="-s -w" -o "bin/scope-guard-mcp${{ matrix.ext }}" ./cmd/scope-guard-mcp
+          go build -trimpath -ldflags="-s -w" -o "bin/attack-surface-mcp${{ matrix.ext }}" ./cmd/attack-surface-mcp
 
       - name: Package release archive
         shell: bash
@@ -68,6 +69,7 @@ jobs:
           cp "target/release/cve-intel-mcp${{ matrix.ext }}" "dist/artex-nexus-${{ matrix.target }}/"
           cp "go/bin/patch-diff-mcp${{ matrix.ext }}" "dist/artex-nexus-${{ matrix.target }}/"
           cp "go/bin/scope-guard-mcp${{ matrix.ext }}" "dist/artex-nexus-${{ matrix.target }}/"
+          cp "go/bin/attack-surface-mcp${{ matrix.ext }}" "dist/artex-nexus-${{ matrix.target }}/"
           cp LICENSE THIRD_PARTY_NOTICES.md SECURITY.md "dist/artex-nexus-${{ matrix.target }}/"
           cd dist
           if [ "${{ matrix.goos }}" = "windows" ]; then

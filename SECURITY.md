@@ -4,9 +4,9 @@
 
 | Version | Supported | Notes |
 |---|---|---|
-| `main` / `v0.3.x` | Yes | Active Rust + Go release branch |
-| `v0.2.x` | Yes | Security fixes backported where applicable |
-| `< v0.2.0` | No | Legacy Python prototype (retired) |
+| `main` / `v0.4.x` | Yes | Active Rust + Go release branch |
+| `v0.3.x` | Yes | Security fixes backported where applicable |
+| `< v0.3.0` | No | Prior prototype releases |
 
 ---
 
@@ -52,3 +52,4 @@ If you used ARTEX-Nexus to discover a vulnerability in **another** project or pr
 - **`cve-intel-mcp` (Rust):** Opens the SQLite database strictly with `SQLITE_OPEN_READ_ONLY` + `PRAGMA query_only = ON`, sanitizes all FTS5 tokens, and executes zero shell or network calls.
 - **`patch-diff-mcp` (Go):** Enforces HTTPS-only allowlisted hosts (`github.com`, `api.github.com`, `gitlab.com`), refuses all HTTP redirects (`http.ErrUseLastResponse`), resolves DNS at `DialContext` time to block loopback/RFC1918/CGNAT/link-local/metadata IPs (`169.254.169.254`), and caps patch bodies at 256 KiB.
 - **`scope-guard-mcp` (Go):** Strictly confines `load_scope_policy` inside `SCOPE_CONFIG_DIR` via symlink-resolved path checks, isolates per-task scopes by `scope_id`, and records findings in a SHA-256 hash-chained append-only JSONL ledger verified by `verify_ledger_chain`.
+- **`attack-surface-mcp` (Go):** Operates strictly offline on local OpenAPI specs, source trees (capped at 2,000 files / 1 MiB per file), JWT strings, and HTTP header maps with zero outbound network requests or shell execution.

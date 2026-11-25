@@ -11,7 +11,8 @@ COPY go/go.mod go/go.sum* ./
 RUN go mod download
 COPY go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/patch-diff-mcp ./cmd/patch-diff-mcp && \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scope-guard-mcp ./cmd/scope-guard-mcp
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scope-guard-mcp ./cmd/scope-guard-mcp && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/attack-surface-mcp ./cmd/attack-surface-mcp
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -19,6 +20,7 @@ COPY --from=rust-builder /src/target/release/nexus-sync /usr/local/bin/nexus-syn
 COPY --from=rust-builder /src/target/release/cve-intel-mcp /usr/local/bin/cve-intel-mcp
 COPY --from=go-builder /out/patch-diff-mcp /usr/local/bin/patch-diff-mcp
 COPY --from=go-builder /out/scope-guard-mcp /usr/local/bin/scope-guard-mcp
+COPY --from=go-builder /out/attack-surface-mcp /usr/local/bin/attack-surface-mcp
 WORKDIR /app
 ENV MCP_HOST=0.0.0.0
 ENV MCP_TRANSPORT=http

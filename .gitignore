@@ -20,6 +20,10 @@ data/receipts/
 .env
 .env.local
 config/artex.config.json
+config/*.local.yaml
+config/*-lab.yaml
+mcp_client.py
+*.sarif
 *.pem
 *.key
 id_rsa*

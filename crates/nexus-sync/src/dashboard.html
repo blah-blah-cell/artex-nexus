@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ARTEX-Nexus — Offline Medium+ CVE, OSV & Writeups Console</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131926;
+      --border: #232d42;
+      --text: #e6edf7;
+      --muted: #8b9bb4;
+      --accent: #7c5cff;
+      --crit: #ff4d6d;
+      --high: #ff8c42;
+      --med: #ffd166;
+      --ok: #2ec4b6;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.5;
+    }
+    header {
+      padding: 18px 28px; border-bottom: 1px solid var(--border);
+      display: flex; flex-wrap: wrap; gap: 16px; align-items: center; justify-content: space-between;
+      background: #0e1420;
+    }
+    .brand { font-size: 20px; font-weight: 700; letter-spacing: 0.3px; }
+    .brand span { color: var(--accent); }
+    .stats { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; color: var(--muted); }
+    .pill {
+      padding: 4px 10px; border-radius: 999px; background: var(--panel);
+      border: 1px solid var(--border); color: var(--text); font-variant-numeric: tabular-nums;
+    }
+    main { max-width: 1280px; margin: 0 auto; padding: 22px 24px; display: grid; gap: 20px; }
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 10px; padding: 16px 18px;
+    }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    input, select, button {
+      background: #0b0f17; color: var(--text); border: 1px solid var(--border);
+      border-radius: 7px; padding: 9px 12px; font-size: 14px;
+    }
+    input[type="text"] { flex: 1 1 260px; min-width: 180px; }
+    button {
+      background: var(--accent); border-color: var(--accent); font-weight: 600; cursor: pointer;
+    }
+    button:hover { opacity: 0.92; }
+    .meta-row { margin-top: 10px; font-size: 13px; color: var(--muted); }
+    .grid { display: grid; grid-template-columns: 1.35fr 1fr; gap: 18px; align-items: start; }
+    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+    .result-item {
+      border-bottom: 1px solid var(--border); padding: 12px 6px; cursor: pointer;
+    }
+    .result-item:hover { background: rgba(124, 92, 255, 0.08); }
+    .result-item:last-child { border-bottom: none; }
+    .row-top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 4px; }
+    .cve-id { font-weight: 700; font-family: ui-monospace, monospace; color: #b7a6ff; }
+    .badge {
+      font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px;
+      background: #1f293d; color: var(--text);
+    }
+    .sev-CRITICAL { background: rgba(255, 77, 109, 0.2); color: #ff8fa3; }
+    .sev-HIGH { background: rgba(255, 140, 66, 0.2); color: #ffb580; }
+    .sev-MEDIUM { background: rgba(255, 209, 102, 0.2); color: #ffe199; }
+    .kev { background: rgba(255, 77, 109, 0.28); color: #ffccd5; }
+    .desc { font-size: 13px; color: var(--muted); }
+    .detail-box h3 { margin: 0 0 8px 0; font-family: ui-monospace, monospace; color: #b7a6ff; }
+    .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); margin: 14px 0 6px; }
+    ul.clean { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; }
+    ul.clean li { font-size: 13px; padding: 7px 9px; background: #0d121c; border: 1px solid var(--border); border-radius: 6px; word-break: break-word; }
+    a { color: #7cc6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    pre.excerpt { white-space: pre-wrap; font-size: 12px; color: var(--muted); margin: 6px 0 0; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">ARTEX-<span>Nexus</span> Offline Intelligence Console</div>
+    <div id="statsBar" class="stats"><span class="pill">Loading stats...</span></div>
+  </header>
+  <main>
+    <section class="card">
+      <form id="searchForm" class="controls">
+        <input id="qInput" type="text" placeholder="Search CVEs, products, or writeup text (e.g. log4j, prototype pollution, SSRF)..." value="log4j" />
+        <select id="modeSelect">
+          <option value="cves">CVEs (cves_fts)</option>
+          <option value="writeups">Writeup Text (writeups_fts)</option>
+        </select>
+        <input id="cweInput" type="text" placeholder="CWE (e.g. CWE-79)" style="max-width:140px;" />
+        <select id="cvssSelect">
+          <option value="4.0">CVSS &ge; 4.0 (Med+)</option>
+          <option value="7.0">CVSS &ge; 7.0 (High+)</option>
+          <option value="9.0">CVSS &ge; 9.0 (Crit)</option>
+        </select>
+        <label style="font-size:13px; display:flex; align-items:center; gap:5px;">
+          <input id="kevCheck" type="checkbox" /> KEV only
+        </label>
+        <button type="submit">Search</button>
+      </form>
+      <div id="searchMeta" class="meta-row">Ready.</div>
+    </section>
+
+    <section class="card">
+      <form id="pkgForm" class="controls">
+        <strong style="font-size:13px;">SemVer Package Check:</strong>
+        <select id="ecoSelect">
+          <option value="npm">npm</option>
+          <option value="PyPI">PyPI</option>
+          <option value="Go">Go</option>
+          <option value="Maven">Maven</option>
+          <option value="crates.io">crates.io</option>
+          <option value="Packagist">Packagist</option>
+        </select>
+        <input id="pkgName" type="text" placeholder="Package (e.g. lodash)" value="lodash" style="max-width:220px;" />
+        <input id="pkgVer" type="text" placeholder="Installed version (e.g. 4.17.15)" value="4.17.15" style="max-width:180px;" />
+        <button type="submit">Check Version</button>
+      </form>
+      <div id="pkgResults" class="meta-row">Check any installed package version against 43k+ OSV/GHSA ranges offline.</div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <div class="section-title" style="margin-top:0;">Results</div>
+        <div id="resultsList"></div>
+      </section>
+      <aside class="card detail-box" id="detailPane">
+        <div class="desc">Select any CVE on the left to inspect its CVSS vector, exact CWEs, OSV package ranges, and writeup excerpts.</div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    function el(tag, cls, text) {
+      const node = document.createElement(tag);
+      if (cls) node.className = cls;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
+    }
+
+    function clearNode(node) {
+      while (node.firstChild) node.removeChild(node.firstChild);
+    }
+
+    async function loadStats() {
+      const bar = document.getElementById("statsBar");
+      try {
+        const res = await fetch("/api/stats");
+        const data = await res.json();
+        clearNode(bar);
+        const m = data.metadata || {};
+        bar.appendChild(el("span", "pill", "CVEs: " + (m.total_cves || 0)));
+        bar.appendChild(el("span", "pill", "KEV: " + (m.kev_count || 0)));
+        bar.appendChild(el("span", "pill", "Writeups: " + (m.total_writeups || 0)));
+        bar.appendChild(el("span", "pill", "Full Text: " + (m.writeups_with_text || 0)));
+        bar.appendChild(el("span", "pill", "OSV Ranges: " + (m.total_packages || 0)));
+      } catch (err) {
+        clearNode(bar);
+        bar.appendChild(el("span", "pill", "Stats unavailable"));
+      }
+    }
+
+    async function loadCveDetail(cveId) {
+      const pane = document.getElementById("detailPane");
+      clearNode(pane);
+      pane.appendChild(el("div", "desc", "Loading " + cveId + "..."));
+      const res = await fetch("/api/cve/" + encodeURIComponent(cveId));
+      const d = await res.json();
+      clearNode(pane);
+      if (!d.found) {
+        pane.appendChild(el("div", "desc", "Not found: " + cveId));
+        return;
+      }
+      pane.appendChild(el("h3", "", d.cve_id));
+      const badges = el("div", "row-top");
+      badges.appendChild(el("span", "badge sev-" + (d.cvss_severity || "MEDIUM"), (d.cvss_severity || "") + (d.cvss_score ? " (" + d.cvss_score + ")" : "")));
+      if (d.is_kev) badges.appendChild(el("span", "badge kev", "CISA KEV"));
+      if (d.epss_score) badges.appendChild(el("span", "badge", "EPSS " + (d.epss_score * 100).toFixed(2) + "%"));
+      (d.cwes || []).forEach(c => badges.appendChild(el("span", "badge", c)));
+      pane.appendChild(badges);
+
+      if (d.title) pane.appendChild(el("div", "", d.title));
+      pane.appendChild(el("div", "section-title", "Description"));
+      pane.appendChild(el("div", "desc", d.description || "No description"));
+      if (d.cvss_vector) {
+        pane.appendChild(el("div", "section-title", "CVSS Vector"));
+        pane.appendChild(el("div", "desc", d.cvss_vector));
+      }
+
+      if ((d.packages || []).length > 0) {
+        pane.appendChild(el("div", "section-title", "OSV / GHSA Package Ranges"));
+        const ul = el("ul", "clean");
+        d.packages.slice(0, 20).forEach(p => {
+          ul.appendChild(el("li", "", p.ecosystem + " / " + p.package_name + "  [" + (p.introduced_ver || "0") + " -> " + (p.fixed_ver || "unfixed") + "] (" + p.advisory_id + ")"));
+        });
+        pane.appendChild(ul);
+      }
+
+      if ((d.writeups || []).length > 0) {
+        pane.appendChild(el("div", "section-title", "Writeups, Advisories & Patches (" + d.writeups.length + ")"));
+        const ul = el("ul", "clean");
+        d.writeups.slice(0, 25).forEach(w => {
+          const li = el("li");
+          const top = el("div", "row-top");
+          top.appendChild(el("span", "badge", w.source));
+          if (w.has_patch_diff) top.appendChild(el("span", "badge", "PATCH"));
+          const link = el("a", "", w.url);
+          link.href = w.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          top.appendChild(link);
+          li.appendChild(top);
+          if (w.content_excerpt) {
+            li.appendChild(el("pre", "excerpt", w.content_excerpt.slice(0, 500)));
+          }
+          ul.appendChild(li);
+        });
+        pane.appendChild(ul);
+      }
+    }
+
+    async function runSearch(e) {
+      if (e) e.preventDefault();
+      const q = document.getElementById("qInput").value.trim();
+      const mode = document.getElementById("modeSelect").value;
+      const cwe = document.getElementById("cweInput").value.trim();
+      const minCvss = document.getElementById("cvssSelect").value;
+      const kev = document.getElementById("kevCheck").checked ? "1" : "0";
+      const meta = document.getElementById("searchMeta");
+      const list = document.getElementById("resultsList");
+      meta.textContent = "Searching...";
+      const url = "/api/search?q=" + encodeURIComponent(q) + "&mode=" + encodeURIComponent(mode) + "&cwe=" + encodeURIComponent(cwe) + "&min_cvss=" + encodeURIComponent(minCvss) + "&kev=" + kev;
+      const res = await fetch(url);
+      const data = await res.json();
+      clearNode(list);
+      if (data.error) {
+        meta.textContent = data.error;
+        return;
+      }
+      meta.textContent = data.count + " results in " + (data.elapsed_ms || 0).toFixed(2) + " ms (" + mode + ")";
+      (data.results || []).forEach(r => {
+        const item = el("div", "result-item");
+        item.addEventListener("click", () => loadCveDetail(r.cve_id));
+        const top = el("div", "row-top");
+        top.appendChild(el("span", "cve-id", r.cve_id));
+        top.appendChild(el("span", "badge sev-" + (r.cvss_severity || "MEDIUM"), (r.cvss_severity || "") + (r.cvss_score ? " " + r.cvss_score : "")));
+        if (r.is_kev) top.appendChild(el("span", "badge kev", "KEV"));
+        if (r.exploit_maturity && r.exploit_maturity !== "NONE") top.appendChild(el("span", "badge", r.exploit_maturity));
+        if (r.source) top.appendChild(el("span", "badge", r.source));
+        item.appendChild(top);
+        if (r.title) item.appendChild(el("div", "", r.title));
+        item.appendChild(el("div", "desc", r.summary || r.excerpt || r.url || ""));
+        list.appendChild(item);
+      });
+    }
+
+    async function runPkgCheck(e) {
+      e.preventDefault();
+      const eco = document.getElementById("ecoSelect").value;
+      const name = document.getElementById("pkgName").value.trim();
+      const ver = document.getElementById("pkgVer").value.trim();
+      const box = document.getElementById("pkgResults");
+      box.textContent = "Checking...";
+      const res = await fetch("/api/package?ecosystem=" + encodeURIComponent(eco) + "&name=" + encodeURIComponent(name) + "&version=" + encodeURIComponent(ver));
+      const data = await res.json();
+      clearNode(box);
+      if (data.error) {
+        box.textContent = data.error;
+        return;
+      }
+      box.appendChild(el("div", "", eco + "/" + name + "@" + ver + " -> " + (data.vulnerable ? data.count + " vulnerabilities found (" + (data.elapsed_ms || 0).toFixed(2) + " ms)" : "No Medium+ OSV range matches (" + (data.elapsed_ms || 0).toFixed(2) + " ms)")));
+      if ((data.vulnerabilities || []).length > 0) {
+        const ul = el("ul", "clean");
+        ul.style.marginTop = "8px";
+        data.vulnerabilities.forEach(v => {
+          const li = el("li");
+          li.style.cursor = "pointer";
+          li.textContent = "[" + v.cvss_severity + " " + (v.cvss_score || "KEV") + "] " + v.cve_id + " (" + v.advisory_id + ") fix: " + (v.fixed_ver || "none") + " — " + v.title;
+          li.addEventListener("click", () => loadCveDetail(v.cve_id));
+          ul.appendChild(li);
+        });
+        box.appendChild(ul);
+      }
+    }
+
+    document.getElementById("searchForm").addEventListener("submit", runSearch);
+    document.getElementById("pkgForm").addEventListener("submit", runPkgCheck);
+    loadStats();
+    runSearch();
+  </script>
+</body>
+</html>
