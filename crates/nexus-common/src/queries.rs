@@ -3,6 +3,8 @@ use crate::{detect_schema_version, open_readonly, sanitize_fts_query};
 use anyhow::Result;
 use rusqlite::{Connection, params, params_from_iter};
 use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -62,6 +64,21 @@ impl CachedDb {
     }
 }
 
+thread_local! {
+    static THREAD_DBS: RefCell<HashMap<PathBuf, CachedDb>> = RefCell::new(HashMap::new());
+}
+
+/// Runs `f` with a thread-local `CachedDb` for `path`, reopening automatically if the file changes.
+pub fn with_cached_db<T>(path: &Path, f: impl FnOnce(&mut CachedDb) -> Result<T>) -> Result<T> {
+    THREAD_DBS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let entry = map
+            .entry(path.to_path_buf())
+            .or_insert_with(|| CachedDb::new(path.to_path_buf()));
+        f(entry)
+    })
+}
+
 pub fn norm_cwe(raw: &str) -> String {
     let s = raw.trim().to_uppercase();
     if s.starts_with("CWE-") {
@@ -71,26 +88,27 @@ pub fn norm_cwe(raw: &str) -> String {
     }
 }
 
-pub fn cwes_for_cve(conn: &Connection, schema: u32, cve_id: &str) -> Vec<String> {
+pub fn cwes_for_cve(conn: &Connection, schema: u32, cve_id: &str) -> Result<Vec<String>> {
     if schema >= 2 {
-        let mut stmt = match conn.prepare_cached("SELECT cwe_id FROM cve_cwes WHERE cve_id = ?1 ORDER BY cwe_id") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([cve_id], |r| r.get::<_, String>(0))
-            .ok()
-            .map(|rows| rows.filter_map(Result::ok).collect())
-            .unwrap_or_default()
+        let mut stmt =
+            conn.prepare_cached("SELECT cwe_id FROM cve_cwes WHERE cve_id = ?1 ORDER BY cwe_id")?;
+        let rows = stmt
+            .query_map([cve_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     } else {
-        conn.query_row("SELECT cwe_ids FROM cves WHERE cve_id = ?1", [cve_id], |r| {
+        match conn.query_row("SELECT cwe_ids FROM cves WHERE cve_id = ?1", [cve_id], |r| {
             r.get::<_, String>(0)
-        })
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+        }) {
+            Ok(raw) => Ok(raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -172,8 +190,7 @@ pub fn query_search_cves(conn: &Connection, schema: u32, opts: &SearchCveOpts<'_
                 "writeup_count": r.get::<_, i64>(9)?
             }))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(json!({
         "query": opts.query,
@@ -233,8 +250,7 @@ pub fn query_search_writeups(
                 "excerpt": r.get::<_, String>(9)?
             }))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(json!({
         "query": query,
@@ -291,7 +307,7 @@ pub fn query_cve_details(conn: &Connection, schema: u32, raw_cve_id: &str) -> Re
         Err(e) => return Err(e.into()),
     };
 
-    record["cwes"] = json!(cwes_for_cve(conn, schema, &cid));
+    record["cwes"] = json!(cwes_for_cve(conn, schema, &cid)?);
 
     let excerpt_col = if schema >= 2 { "content_excerpt" } else { "''" };
     let wu_sql = format!(
@@ -311,8 +327,7 @@ pub fn query_cve_details(conn: &Connection, schema: u32, raw_cve_id: &str) -> Re
                 "content_excerpt": r.get::<_, String>(5)?
             }))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     record["writeups"] = json!(writeups);
 
     if schema >= 2 {
@@ -330,8 +345,7 @@ pub fn query_cve_details(conn: &Connection, schema: u32, raw_cve_id: &str) -> Re
                     "advisory_id": r.get::<_, String>(4)?
                 }))
             })?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         record["packages"] = json!(pkgs);
     }
 
@@ -369,7 +383,8 @@ pub fn query_package_vulns(
             r.get::<_, String>(11)?,
         ))
     })?;
-    for (cve_id, eco, pkg, intro, fixed, adv, score, sev, is_kev, epss, mat, title) in rows.flatten() {
+    for row in rows {
+        let (cve_id, eco, pkg, intro, fixed, adv, score, sev, is_kev, epss, mat, title) = row?;
         if is_version_affected(version, &intro, &fixed) == Some(true) {
             findings.push(json!({
                 "cve_id": cve_id,
@@ -394,28 +409,22 @@ pub fn query_package_vulns(
 pub fn query_kb_stats(conn: &Connection, schema: u32) -> Result<Value> {
     let mut meta = serde_json::Map::new();
     let mut stmt = conn.prepare_cached("SELECT key, value FROM metadata")?;
-    for (k, v) in stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .flatten()
-    {
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (k, v) = row?;
         meta.insert(k, json!(v));
     }
     let mut by_sev = serde_json::Map::new();
     let mut sev_stmt = conn.prepare_cached("SELECT cvss_severity, COUNT(*) FROM cves GROUP BY cvss_severity")?;
-    for (k, v) in sev_stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .flatten()
-    {
+    for row in sev_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let (k, v) = row?;
         by_sev.insert(k, json!(v));
     }
     let mut by_maturity = serde_json::Map::new();
     if schema >= 2 {
         let mut mat_stmt =
             conn.prepare_cached("SELECT exploit_maturity, COUNT(*) FROM cves GROUP BY exploit_maturity")?;
-        for (k, v) in mat_stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-            .flatten()
-        {
+        for row in mat_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (k, v) = row?;
             by_maturity.insert(k, json!(v));
         }
     }

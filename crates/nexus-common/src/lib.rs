@@ -1,3 +1,4 @@
+pub mod http_srv;
 pub mod queries;
 pub mod version;
 

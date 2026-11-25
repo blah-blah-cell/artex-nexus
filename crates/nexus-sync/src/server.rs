@@ -1,8 +1,14 @@
 use anyhow::Result;
+use http::{HeaderValue, Method, header};
+use nexus_common::http_srv::{
+    HttpRequest, HttpResponse, ServerConfig, serve_http_blocking,
+};
+#[cfg(test)]
+use nexus_common::http_srv::{RunningServer, spawn_http_server};
 use nexus_common::open_readonly;
 use nexus_common::queries::{
     CachedDb, SearchCveOpts, norm_cwe, query_cve_details, query_kb_stats, query_package_vulns,
-    query_search_cves, query_search_writeups,
+    query_search_cves, query_search_writeups, with_cached_db,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
@@ -14,11 +20,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tiny_http::{Header, Method, Request, Response, Server};
 use walkdir::WalkDir;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
-const DASHBOARD_WORKERS: usize = 4;
 
 /// Field order matches Go's `scope-guard-mcp` LedgerEntry so JSON serialization
 /// produces identical bytes for SHA-256 verification.
@@ -119,12 +123,8 @@ fn extract_origin_host(origin: &str) -> Option<String> {
     Some(host_port.split(':').next()?.to_lowercase())
 }
 
-fn extract_host_header(req: &Request) -> Option<String> {
-    let raw = req
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Host"))
-        .map(|h| h.value.as_str().trim())?;
+fn extract_host_header(req: &HttpRequest) -> Option<String> {
+    let raw = req.headers.get(header::HOST)?.to_str().ok()?.trim();
     if let Some(b) = raw.strip_prefix('[') {
         return b.split(']').next().map(str::to_lowercase);
     }
@@ -150,13 +150,14 @@ enum OriginCheck<'a> {
     Forbidden,
 }
 
-fn check_origin<'a>(req: &Request, allowed: &'a [String]) -> OriginCheck<'a> {
-    let origins: Vec<&str> = req
-        .headers()
-        .iter()
-        .filter(|h| h.field.equiv("Origin"))
-        .map(|h| h.value.as_str().trim())
-        .collect();
+fn check_origin<'a>(req: &HttpRequest, allowed: &'a [String]) -> OriginCheck<'a> {
+    let mut origins = Vec::new();
+    for val in req.headers.get_all(header::ORIGIN) {
+        let Ok(s) = val.to_str() else {
+            return OriginCheck::Forbidden;
+        };
+        origins.push(s.trim());
+    }
     if origins.is_empty() {
         return OriginCheck::None;
     }
@@ -362,89 +363,73 @@ fn api_playbooks(knowledge_dir: &Path) -> Result<Value> {
     Ok(json!({"count": items.len(), "playbooks": items}))
 }
 
-fn json_response(
-    status: u16,
-    body: Value,
-    cors_origin: Option<&str>,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    let hdr = Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap();
-    let mut resp = Response::from_string(body.to_string())
-        .with_status_code(status)
-        .with_header(hdr);
-    if let Some(origin) = cors_origin
-        && let Ok(cors_hdr) = Header::from_bytes("Access-Control-Allow-Origin", origin)
-    {
+fn json_response(status: u16, body: Value, cors_origin: Option<&str>) -> HttpResponse {
+    let mut resp = HttpResponse::json(status, &body);
+    if let Some(origin) = cors_origin {
         resp = resp
-            .with_header(cors_hdr)
-            .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+            .with_header("Access-Control-Allow-Origin", origin)
+            .with_header("Vary", "Origin");
     }
     resp
 }
 
 fn handle_dashboard_request(
-    request: Request,
-    db: &mut CachedDb,
+    req: HttpRequest,
+    db_path: &Path,
     receipts_dir: &Path,
     knowledge_dir: &Path,
     allowed_origins: &[String],
     allowed_hosts: &HashSet<String>,
-) {
+) -> HttpResponse {
     // Reject DNS-rebinding requests carrying an unknown Host header.
-    if let Some(host) = extract_host_header(&request)
+    if let Some(host) = extract_host_header(&req)
         && !allowed_hosts.contains(&host)
     {
-        let _ = request.respond(Response::from_string("Forbidden host").with_status_code(403));
-        return;
+        return HttpResponse::text(403, "Forbidden host");
     }
 
-    let origin_check = check_origin(&request, allowed_origins);
+    let origin_check = check_origin(&req, allowed_origins);
     let cors = match origin_check {
         OriginCheck::Allowed(o) => Some(o),
         OriginCheck::None => None,
         OriginCheck::Forbidden => {
-            if *request.method() == Method::Options || request.url().starts_with("/api/") {
-                let _ = request.respond(Response::from_string("Forbidden origin").with_status_code(403));
-                return;
+            if req.method == Method::OPTIONS || req.uri.starts_with("/api/") {
+                return HttpResponse::text(403, "Forbidden origin");
             }
             None
         }
     };
 
-    if *request.method() == Method::Options {
-        let mut resp = Response::from_string("")
-            .with_status_code(204)
-            .with_header(Header::from_bytes("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS").unwrap());
-        if let Some(origin) = cors
-            && let Ok(cors_hdr) = Header::from_bytes("Access-Control-Allow-Origin", origin)
-        {
+    if req.method == Method::OPTIONS {
+        let mut resp = HttpResponse::empty(204)
+            .with_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+        if let Some(origin) = cors {
             resp = resp
-                .with_header(cors_hdr)
-                .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+                .with_header("Access-Control-Allow-Origin", origin)
+                .with_header("Vary", "Origin");
         }
-        let _ = request.respond(resp);
-        return;
+        return resp;
     }
-    if *request.method() != Method::Get && *request.method() != Method::Head {
-        let _ = request.respond(Response::from_string("Method Not Allowed").with_status_code(405));
-        return;
+    if req.method != Method::GET && req.method != Method::HEAD {
+        return HttpResponse::text(405, "Method Not Allowed");
     }
 
-    let full_url = request.url().to_string();
+    let full_url = req.uri.clone();
     let (path, qparams) = parse_query_params(&full_url);
-    let resp = match path {
-        "/" | "/index.html" => {
-            let hdr = Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap();
-            Response::from_string(DASHBOARD_HTML).with_header(hdr)
-        }
-        "/api/stats" => match db.connection().and_then(|(c, s)| query_kb_stats(c, s)) {
+    match path {
+        "/" | "/index.html" => HttpResponse::html(200, DASHBOARD_HTML),
+        "/api/stats" => match with_cached_db(db_path, |db| {
+            let (c, s) = db.connection()?;
+            query_kb_stats(c, s)
+        }) {
             Ok(v) => json_response(200, v, cors),
             Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
         },
-        "/api/search" => match api_search(db, &qparams) {
+        "/api/search" => match with_cached_db(db_path, |db| api_search(db, &qparams)) {
             Ok(v) => json_response(200, v, cors),
             Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
         },
-        "/api/package" => match api_package_check(db, &qparams) {
+        "/api/package" => match with_cached_db(db_path, |db| api_package_check(db, &qparams)) {
             Ok(v) => json_response(200, v, cors),
             Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
         },
@@ -458,52 +443,42 @@ fn handle_dashboard_request(
         },
         p if p.starts_with("/api/cve/") => {
             let cid = percent_decode(p.trim_start_matches("/api/cve/"));
-            match db
-                .connection()
-                .and_then(|(c, s)| query_cve_details(c, s, &cid))
-            {
+            match with_cached_db(db_path, |db| {
+                let (c, s) = db.connection()?;
+                query_cve_details(c, s, &cid)
+            }) {
                 Ok(v) => json_response(200, v, cors),
                 Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
             }
         }
-        _ => Response::from_string("Not Found").with_status_code(404),
-    };
-    let _ = request.respond(resp);
+        _ => HttpResponse::text(404, "Not Found"),
+    }
 }
 
-pub fn serve_dashboard(
-    server: Arc<Server>,
+fn filter_valid_origins(allowed_origins: Vec<String>) -> Vec<String> {
+    allowed_origins
+        .into_iter()
+        .filter(|o| HeaderValue::from_str(o).is_ok())
+        .collect()
+}
+
+#[cfg(test)]
+pub fn spawn_dashboard(
+    bind_addr: &str,
     db_path: PathBuf,
     receipts_dir: PathBuf,
     knowledge_dir: PathBuf,
     allowed_origins: Vec<String>,
-) {
-    let origins: Arc<Vec<String>> = Arc::new(
-        allowed_origins
-            .into_iter()
-            .filter(|o| Header::from_bytes("Access-Control-Allow-Origin", o.as_str()).is_ok())
-            .collect(),
-    );
+) -> Result<RunningServer> {
+    let origins = Arc::new(filter_valid_origins(allowed_origins));
     let hosts = Arc::new(build_allowed_hosts(&origins));
+    let db_path = Arc::new(db_path);
+    let receipts_dir = Arc::new(receipts_dir);
+    let knowledge_dir = Arc::new(knowledge_dir);
 
-    let mut handles = Vec::with_capacity(DASHBOARD_WORKERS);
-    for _ in 0..DASHBOARD_WORKERS {
-        let srv = Arc::clone(&server);
-        let dbp = db_path.clone();
-        let rdir = receipts_dir.clone();
-        let kdir = knowledge_dir.clone();
-        let orig = Arc::clone(&origins);
-        let hset = Arc::clone(&hosts);
-        handles.push(std::thread::spawn(move || {
-            let mut db = CachedDb::new(dbp);
-            for request in srv.incoming_requests() {
-                handle_dashboard_request(request, &mut db, &rdir, &kdir, &orig, &hset);
-            }
-        }));
-    }
-    for h in handles {
-        let _ = h.join();
-    }
+    spawn_http_server(bind_addr, ServerConfig::default(), move |req| {
+        handle_dashboard_request(req, &db_path, &receipts_dir, &knowledge_dir, &origins, &hosts)
+    })
 }
 
 pub fn cmd_serve(
@@ -516,7 +491,6 @@ pub fn cmd_serve(
 ) -> Result<()> {
     let _ = open_readonly(&db_path)?;
     let addr = format!("{host}:{port}");
-    let server = Arc::new(Server::http(&addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?);
     let mut origins = if cors_origins.is_empty() {
         default_cors_origins()
     } else {
@@ -529,7 +503,14 @@ pub fn cmd_serve(
             origins.push(self_origin);
         }
     }
+    let origins = Arc::new(filter_valid_origins(origins));
+    let hosts = Arc::new(build_allowed_hosts(&origins));
+    let db_path = Arc::new(db_path);
+    let receipts_dir = Arc::new(receipts_dir);
+    let knowledge_dir = Arc::new(knowledge_dir);
+
     eprintln!("[+] ARTEX-Nexus Web Console listening on http://{addr}");
-    serve_dashboard(server, db_path, receipts_dir, knowledge_dir, origins);
-    Ok(())
+    serve_http_blocking(&addr, ServerConfig::default(), move |req| {
+        handle_dashboard_request(req, &db_path, &receipts_dir, &knowledge_dir, &origins, &hosts)
+    })
 }
