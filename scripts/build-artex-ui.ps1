@@ -62,9 +62,12 @@ finally {
         }
     }
     Write-Host "[*] Restoring clean vendor/ARTEX git submodule working tree..."
-    git -C $ArtexDir checkout -- web/src/config/app-config.ts web/src/navigation/sidebar/sidebar-items.ts 2>$null
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    git -C $ArtexDir checkout -- web/src/config/app-config.ts web/src/navigation/sidebar/sidebar-items.ts 2>$null | Out-Null
     $NexusPageDir = Join-Path $WebDir "src\app\(main)\nexus"
     if (Test-Path $NexusPageDir) { Remove-Item -Recurse -Force $NexusPageDir }
-    git -C $ArtexDir clean -fd server/webui/dist 2>$null
-    git -C $ArtexDir checkout -- server/webui/dist 2>$null
+    if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
+    git -C $ArtexDir checkout -- server/webui/dist 2>$null | Out-Null
+    $ErrorActionPreference = $prevEap
 }
