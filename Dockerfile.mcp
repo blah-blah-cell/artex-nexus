@@ -1,0 +1,30 @@
+# Multi-stage Rust + Go build for ARTEX-Nexus MCP servers
+FROM rust:1.88-slim-bookworm AS rust-builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+RUN cargo build --release --workspace
+
+FROM golang:1.26-bookworm AS go-builder
+WORKDIR /src/go
+COPY go/go.mod go/go.sum* ./
+RUN go mod download
+COPY go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/patch-diff-mcp ./cmd/patch-diff-mcp && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scope-guard-mcp ./cmd/scope-guard-mcp && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/attack-surface-mcp ./cmd/attack-surface-mcp
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && \
+    groupadd -g 10001 nexus && useradd -u 10001 -g 10001 -m -s /usr/sbin/nologin nexus && \
+    mkdir -p /app /data /config /workspace && chown -R nexus:nexus /app /data /config /workspace
+COPY --from=rust-builder /src/target/release/nexus-sync /usr/local/bin/nexus-sync
+COPY --from=rust-builder /src/target/release/cve-intel-mcp /usr/local/bin/cve-intel-mcp
+COPY --from=go-builder /out/patch-diff-mcp /usr/local/bin/patch-diff-mcp
+COPY --from=go-builder /out/scope-guard-mcp /usr/local/bin/scope-guard-mcp
+COPY --from=go-builder /out/attack-surface-mcp /usr/local/bin/attack-surface-mcp
+WORKDIR /app
+USER nexus
+ENV MCP_HOST=0.0.0.0
+ENV MCP_TRANSPORT=http
+ENV ATTACK_SURFACE_ROOT=/workspace

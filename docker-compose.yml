@@ -1,0 +1,125 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-artex}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-artex}
+    volumes:
+      - artex_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  artex:
+    build:
+      context: ./vendor/ARTEX
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cve-intel-mcp:
+        condition: service_started
+      patch-diff-mcp:
+        condition: service_started
+      scope-guard-mcp:
+        condition: service_started
+      attack-surface-mcp:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${ARTEX_PORT:-8787}:8787"
+    environment:
+      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-artex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex}?sslmode=disable
+      ARTEX_SKILL_DIR: /opt/artex-nexus-skills
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
+      ARTEX_LLM_MODEL: ${ARTEX_LLM_MODEL:-}
+      ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
+      ARTEX_NOISE_PROFILE: ${ARTEX_NOISE_PROFILE:-quiet}
+      ARTEX_TASK_BUDGET_TOKENS: ${ARTEX_TASK_BUDGET_TOKENS:-}
+      ARTEX_TASK_BUDGET_TURNS: ${ARTEX_TASK_BUDGET_TURNS:-}
+      ARTEX_INTENT_BUDGET_TOKENS: ${ARTEX_INTENT_BUDGET_TOKENS:-}
+      ARTEX_INTENT_BUDGET_TURNS: ${ARTEX_INTENT_BUDGET_TURNS:-}
+    volumes:
+      - ./skills:/opt/artex-nexus-skills:ro
+      - ./knowledge:/opt/artex-nexus-knowledge:ro
+      - ./data:/data:ro
+      - ./config:/config:ro
+      - ./workspace:/workspace
+
+  cve-intel-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["cve-intel-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8901", "--db-path", "/data/cve_kb_med_plus.sqlite"]
+    environment:
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:8901:8901"
+    volumes:
+      - ./data:/data:ro
+
+  patch-diff-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["patch-diff-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8902"]
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:8902:8902"
+
+  scope-guard-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["scope-guard-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8903", "--config-dir", "/config", "--state-dir", "/state/receipts"]
+    environment:
+      SCOPE_DEFAULT_POLICY: ${SCOPE_DEFAULT_POLICY:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:8903:8903"
+    volumes:
+      - scope_state:/state
+      - ./config:/config:ro
+
+  attack-surface-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["attack-surface-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8904", "--workspace-dir", "/workspace"]
+    environment:
+      ATTACK_SURFACE_ROOT: /workspace
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+    ports:
+      - "127.0.0.1:8904:8904"
+    volumes:
+      - ./workspace:/workspace:ro
+
+  nexus-console:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    restart: unless-stopped
+    command: ["nexus-sync", "serve", "--host", "0.0.0.0", "--port", "8088", "--db", "/data/cve_kb_med_plus.sqlite", "--receipts-dir", "/state/receipts", "--knowledge-dir", "/opt/artex-nexus-knowledge"]
+    environment:
+      NEXUS_CORS_ORIGINS: ${NEXUS_CORS_ORIGINS:-http://127.0.0.1:8787,http://localhost:8787}
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./data:/data:ro
+      - scope_state:/state:ro
+      - ./knowledge:/opt/artex-nexus-knowledge:ro
+
+volumes:
+  artex_pgdata:
+  scope_state:
