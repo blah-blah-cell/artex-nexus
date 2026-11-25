@@ -453,14 +453,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::{KevEntry, parse_cve5_value, write_records_to_db};
+    use crate::ingest::{
+        KevEntry, classify_reference, parse_cve5_value, parse_epss_reader, parse_trickest_markdown,
+        write_records_to_db,
+    };
     use crate::scan::{build_sarif_report, parse_dependencies_from_file};
-    use crate::server::{LedgerEntry, api_receipts, compute_ledger_hash, default_cors_origins, serve_dashboard};
+    use crate::server::{
+        LedgerEntry, api_receipts, compute_ledger_hash, default_cors_origins, spawn_dashboard,
+    };
     use reqwest::blocking::Client;
     use rusqlite::Connection;
-    use std::sync::Arc;
     use tempfile::tempdir;
-    use tiny_http::Server;
 
     fn sample_cve(id: &str, score: Option<f64>, cwe: &str, state: &str) -> Value {
         let metrics = match score {
@@ -695,18 +698,20 @@ mod tests {
         .unwrap();
         write_records_to_db(&db, &[r1], 4.0, None, None, Some(&osv_dir)).unwrap();
 
-        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
-        let addr = server.server_addr().to_ip().unwrap();
-        let srv_clone = Arc::clone(&server);
-        let db_clone = db.clone();
         let receipts_dir = dir.path().join("receipts");
         let knowledge_dir = dir.path().join("knowledge");
         fs::create_dir_all(&receipts_dir).unwrap();
         fs::create_dir_all(&knowledge_dir).unwrap();
         fs::write(knowledge_dir.join("demo-playbook.md"), "# Demo Playbook\nCheck BOLA.\n").unwrap();
-        std::thread::spawn(move || {
-            serve_dashboard(srv_clone, db_clone, receipts_dir, knowledge_dir, default_cors_origins())
-        });
+        let mut server = spawn_dashboard(
+            "127.0.0.1:0",
+            db,
+            receipts_dir,
+            knowledge_dir,
+            default_cors_origins(),
+        )
+        .unwrap();
+        let addr = server.addr;
 
         let client = Client::new();
 
@@ -749,11 +754,80 @@ mod tests {
         assert_eq!(pkg["vulnerable"], true);
         assert_eq!(pkg["count"], 1);
 
-        server.unblock();
+        server.stop();
     }
 
     #[test]
-    fn bootstrap_prompt_merge_is_idempotent_and_dry_run_works() {
+    fn ingest_fixes_classify_trickest_lessthan_and_epss_stream() {
+        // classify_reference must not treat generic github.com repos or random 'advisories' substrings as writeups.
+        assert_eq!(classify_reference("https://github.com/org/repo/issues/42", &[]), ("reference", false));
+        assert_eq!(classify_reference("https://example.test/my-advisories-page", &[]), ("reference", false));
+        assert_eq!(
+            classify_reference("https://github.com/org/repo/security/advisories/GHSA-1234", &[]),
+            ("advisory", false)
+        );
+        assert_eq!(
+            classify_reference("https://github.com/org/repo/commit/abcdef1", &[]),
+            ("patch", true)
+        );
+        assert_eq!(
+            classify_reference("https://blog.example.test/cve-post", &[]),
+            ("writeup", false)
+        );
+
+        // ingest_trickest must only mark actual PoC repos under the Github section as trickest:poc.
+        let md = "\
+### Description
+Test
+### POC
+#### Reference
+- https://github.com/vendor/app/issues/9
+- https://github.com/vendor/app/security/advisories/GHSA-aaaa
+- https://github.com/vendor/app/commit/1234567
+#### Github
+- https://github.com/researcher/CVE-2026-5000-poc
+- https://github.com/vendor/app/pull/10
+";
+        let records = parse_trickest_markdown("CVE-2026-5000", md);
+        let by_url: HashMap<&str, &str> = records
+            .iter()
+            .map(|r| (r.url.as_str(), r.source.as_str()))
+            .collect();
+        assert_eq!(by_url["https://github.com/vendor/app/issues/9"], "trickest:writeup");
+        assert_eq!(by_url["https://github.com/vendor/app/security/advisories/GHSA-aaaa"], "trickest:writeup");
+        assert_eq!(by_url["https://github.com/vendor/app/commit/1234567"], "trickest:patch");
+        assert_eq!(by_url["https://github.com/vendor/app/pull/10"], "trickest:patch");
+        assert_eq!(by_url["https://github.com/researcher/CVE-2026-5000-poc"], "trickest:poc");
+
+        // lessThan / lessThanOrEqual upper bounds must be preserved in affected_products.
+        let cve_ranges = json!({
+            "cveMetadata": {"cveId": "CVE-2026-5001", "state": "PUBLISHED"},
+            "containers": {
+                "cna": {
+                    "descriptions": [{"lang": "en", "value": "Range test"}],
+                    "affected": [{
+                        "vendor": "Acme",
+                        "product": "Widget",
+                        "versions": [
+                            {"version": "1.0.0", "lessThan": "1.5.0"},
+                            {"version": "0", "lessThanOrEqual": "0.9.9"}
+                        ]
+                    }],
+                    "metrics": [{"cvssV3_1": {"version": "3.1", "baseScore": 7.5}}]
+                }
+            }
+        });
+        let rec = parse_cve5_value(&cve_ranges, &HashMap::new(), &HashMap::new(), 4.0).unwrap();
+        assert_eq!(rec.affected_products[0].versions, vec![">= 1.0.0, < 1.5.0", "<= 0.9.9"]);
+
+        // Streaming EPSS reader handles comment lines + header without double-copying.
+        let epss_csv = "#model_version:v2025.03.14,score_date:2026-01-01\ncve,epss,percentile\nCVE-2026-0001,0.42,0.98\n";
+        let epss = parse_epss_reader(epss_csv.as_bytes()).unwrap();
+        assert_eq!(epss.get("CVE-2026-0001"), Some(&(0.42, 0.98)));
+    }
+
+    #[test]
+    fn bootstrap_prompt_merge_is_idempotent_and_preserves_trailing_text() {
         let cfg = bootstrap::BootstrapConfig {
             artex_url: "http://127.0.0.1:8787".to_string(),
             password: "test".to_string(),
@@ -778,8 +852,16 @@ mod tests {
         assert_eq!(dry["dry_run"], true);
         let block = bootstrap::build_role_context("planner", &cfg).unwrap();
         assert!(block.contains("extract_js_endpoints"));
+        assert!(!block.contains("227k+"));
         let once = bootstrap::merge_prompt("Base prompt.", &block);
         let twice = bootstrap::merge_prompt(&once, &block);
         assert_eq!(once, twice);
+
+        // User-added text after the end marker must survive re-bootstrapping.
+        let with_footer = format!("{once}\nCustom operator instructions.");
+        let remerged = bootstrap::merge_prompt(&with_footer, &block);
+        assert!(remerged.starts_with("Base prompt."));
+        assert!(remerged.ends_with("Custom operator instructions.\n"));
+        assert_eq!(remerged, bootstrap::merge_prompt(&remerged, &block));
     }
 }

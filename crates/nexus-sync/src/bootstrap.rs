@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 pub const CONTEXT_MARKER: &str = "<!-- ARTEX-NEXUS-CONTEXT-V2 -->";
+pub const CONTEXT_END_MARKER: &str = "<!-- /ARTEX-NEXUS-CONTEXT-V2 -->";
 const LEGACY_MARKER: &str = "<!-- ARTEX-NEXUS-CONTEXT-V1 -->";
 
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ pub fn build_role_context(role: &str, cfg: &BootstrapConfig) -> Option<String> {
 ## ARTEX-Nexus Platform Context, MCP Servers & Knowledge Base
 You operate inside **ARTEX-Nexus** with four compiled Streamable HTTP MCP servers attached as deferred tools. ARTEX withholds MCP schemas until queried, so **explicitly call `SearchExtraTools` and `ExecuteExtraTool`** instead of guessing in raw shell:
 
-1. **`cve-intel-mcp`** (offline SQLite dual-FTS5 KB: 227k+ Medium+ CVEs, CISA KEVs, 21k+ GHSA/OSV full writeups, 43k+ OSV SemVer ranges):
+1. **`cve-intel-mcp`** (offline SQLite dual-FTS5 KB of Medium+ CVEs, CISA KEVs, GHSA/OSV writeups, and OSV SemVer ranges; call `get_kb_stats` for live counts):
    - Tools: `search_cves`, `search_writeups`, `get_cve_details`, `match_product_cves`, `check_package_version`, `scan_dependencies`, `list_cwe_writeups`, `whats_new`, `get_kb_stats`.
    - Call whenever you fingerprint any product, framework, JS/Go/Python/Java package version, or CWE class.
 2. **`patch-diff-mcp`** (SSRF-hardened commit/PR diff analyzer):
@@ -115,18 +116,39 @@ You operate inside **ARTEX-Nexus** with four compiled Streamable HTTP MCP server
         _ => return None,
     };
 
-    Some(format!("{common}\n{addon}\n"))
+    Some(format!("{common}\n{addon}\n{CONTEXT_END_MARKER}\n"))
 }
 
 pub fn merge_prompt(existing: &str, nexus_block: &str) -> String {
-    let base = if let Some(idx) = existing.find(CONTEXT_MARKER) {
-        &existing[..idx]
-    } else if let Some(idx) = existing.find(LEGACY_MARKER) {
-        &existing[..idx]
+    let block = nexus_block.trim();
+    let start_opt = existing
+        .find(CONTEXT_MARKER)
+        .or_else(|| existing.find(LEGACY_MARKER));
+
+    if let Some(start) = start_opt {
+        let prefix = existing[..start].trim_end();
+        let tail = &existing[start..];
+        let suffix = tail
+            .find(CONTEXT_END_MARKER)
+            .map(|end_rel| tail[end_rel + CONTEXT_END_MARKER.len()..].trim())
+            .unwrap_or("");
+        let mut parts: Vec<&str> = Vec::with_capacity(3);
+        if !prefix.is_empty() {
+            parts.push(prefix);
+        }
+        parts.push(block);
+        if !suffix.is_empty() {
+            parts.push(suffix);
+        }
+        return format!("{}\n", parts.join("\n\n"));
+    }
+
+    let trimmed = existing.trim_end();
+    if trimmed.is_empty() {
+        format!("{block}\n")
     } else {
-        existing
-    };
-    format!("{}\n\n{}\n", base.trim_end(), nexus_block.trim())
+        format!("{trimmed}\n\n{block}\n")
+    }
 }
 
 fn api_call(
@@ -189,7 +211,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
 
     // 1. Optional first-boot init if setup_token is provided
     if let Some(stoken) = &cfg.setup_token {
-        let _ = api_call(
+        let (init_st, init_val) = api_call(
             &client,
             base,
             reqwest::Method::POST,
@@ -197,6 +219,9 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             None,
             Some(json!({"password": cfg.password, "setup_token": stoken})),
         )?;
+        if !matches!(init_st, 200 | 201 | 409) {
+            bail!("ARTEX auth init failed (HTTP {init_st}): {init_val}");
+        }
     }
 
     // 2. Login as ARTEX
@@ -233,7 +258,11 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
     }
 
     // 3. Register & refresh all 4 artex-nexus HTTP MCPs
-    let (_, existing_mcps_val) = api_call(&client, base, reqwest::Method::GET, "/api/mcp", Some(&token), None)?;
+    let (mcp_st, existing_mcps_val) =
+        api_call(&client, base, reqwest::Method::GET, "/api/mcp", Some(&token), None)?;
+    if mcp_st != 200 {
+        bail!("failed to list ARTEX MCP servers (HTTP {mcp_st}): {existing_mcps_val}");
+    }
     let existing_list = existing_mcps_val
         .as_array()
         .or_else(|| existing_mcps_val.get("servers").and_then(|v| v.as_array()))
@@ -283,6 +312,9 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             Some(&token),
             Some(json!({})),
         )?;
+        if rst != 200 {
+            bail!("failed to refresh MCP {name} (HTTP {rst}): {rval}");
+        }
         let tool_cnt = rval
             .get("tools")
             .and_then(|v| v.as_array())
@@ -327,7 +359,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
 
     // 5. Configure safety turn/time caps + optional model bindings
     if let Some(wid) = cfg.worker_profile_id {
-        let _ = api_call(
+        let (act_st, act_val) = api_call(
             &client,
             base,
             reqwest::Method::POST,
@@ -335,6 +367,9 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             Some(&token),
             Some(json!({"id": wid})),
         )?;
+        if act_st != 200 {
+            bail!("failed to activate worker LLM profile {wid} (HTTP {act_st}): {act_val}");
+        }
     }
 
     for role in ["goals", "planner", "mainagent", "worker", "auto", "pentest", "reporter", "retester"] {
@@ -386,7 +421,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
                 None,
             )?;
             if gst != 200 {
-                continue;
+                bail!("failed to load agent {role} prompt (HTTP {gst}): {agent_val}");
             }
             let cur = agent_val.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
             let merged = merge_prompt(cur, &block);
@@ -417,7 +452,11 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
         let hname = hname.trim();
         let hval = hval.trim();
         let rule_name = format!("Nexus-Header-{hname}");
-        let (_, rw_val) = api_call(&client, base, reqwest::Method::GET, "/api/traffic/rewrite-rules", Some(&token), None)?;
+        let (rw_st, rw_val) =
+            api_call(&client, base, reqwest::Method::GET, "/api/traffic/rewrite-rules", Some(&token), None)?;
+        if rw_st != 200 {
+            bail!("failed to list traffic rewrite rules (HTTP {rw_st}): {rw_val}");
+        }
         let rules = rw_val
             .as_array()
             .or_else(|| rw_val.get("rules").and_then(|v| v.as_array()))
@@ -454,7 +493,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             created["id"].as_i64().unwrap_or(0)
         };
         if rid > 0 {
-            let (_, tval) = api_call(
+            let (tst, tval) = api_call(
                 &client,
                 base,
                 reqwest::Method::POST,
@@ -462,6 +501,9 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
                 Some(&token),
                 Some(json!({"enabled": true})),
             )?;
+            if tst != 200 {
+                bail!("failed to enable rewrite rule {rid} (HTTP {tst}): {tval}");
+            }
             rewrite_info = json!({"id": rid, "name": rule_name, "enabled": tval.get("enabled")});
         }
     }

@@ -104,32 +104,30 @@ pub fn fetch_kev_map(client: &Client) -> Result<HashMap<String, KevEntry>> {
     Ok(map)
 }
 
+pub fn parse_epss_reader<R: Read>(reader: R) -> Result<HashMap<String, (f64, f64)>> {
+    let mut csv_reader = csv::ReaderBuilder::new()
+        .comment(Some(b'#'))
+        .has_headers(true)
+        .from_reader(BufReader::new(reader));
+    let mut map = HashMap::with_capacity(280_000);
+    let mut rec = csv::StringRecord::new();
+    while csv_reader.read_record(&mut rec)? {
+        if let (Some(cve), Some(epss), Some(pct)) = (rec.get(0), rec.get(1), rec.get(2))
+            && let (Ok(e), Ok(p)) = (epss.trim().parse::<f64>(), pct.trim().parse::<f64>())
+        {
+            map.insert(cve.trim().to_uppercase(), (e, p));
+        }
+    }
+    Ok(map)
+}
+
 pub fn fetch_epss_map(client: &Client) -> Result<HashMap<String, (f64, f64)>> {
     let resp = client
         .get(EPSS_CSV_GZ_URL)
         .send()
         .context("fetching FIRST EPSS feed")?
         .error_for_status()?;
-    let mut decoder = GzDecoder::new(resp);
-    let mut raw = String::new();
-    decoder.read_to_string(&mut raw)?;
-
-    let cleaned: String = raw
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut reader = csv::Reader::from_reader(cleaned.as_bytes());
-    let mut map = HashMap::with_capacity(280_000);
-    for rec in reader.records().flatten() {
-        if let (Some(cve), Some(epss), Some(pct)) = (rec.get(0), rec.get(1), rec.get(2))
-            && let (Ok(e), Ok(p)) = (epss.parse::<f64>(), pct.parse::<f64>())
-        {
-            map.insert(cve.trim().to_uppercase(), (e, p));
-        }
-    }
-    Ok(map)
+    parse_epss_reader(GzDecoder::new(resp))
 }
 
 fn extract_cvss(containers: &Value) -> (Option<f64>, String, String, String) {
@@ -192,7 +190,11 @@ fn extract_cvss(containers: &Value) -> (Option<f64>, String, String, String) {
     }
 }
 
-fn classify_reference(url: &str, tags: &[String]) -> (&'static str, bool) {
+fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+pub fn classify_reference(url: &str, tags: &[String]) -> (&'static str, bool) {
     let lower_tags: HashSet<String> = tags.iter().map(|t| t.to_lowercase()).collect();
     let has_patch = lower_tags.contains("patch") || patch_patterns().iter().any(|p| p.is_match(url));
     if has_patch {
@@ -204,26 +206,36 @@ fn classify_reference(url: &str, tags: &[String]) -> (&'static str, bool) {
     if lower_tags.contains("vendor-advisory") || lower_tags.contains("third-party-advisory") {
         return ("advisory", false);
     }
-    let low_url = url.to_lowercase();
-    let writeup_domains = [
-        "github.com",
-        "blog.",
-        "medium.com",
-        "hackerone.com",
-        "huntr.com",
-        "projectzero",
-        "zerodayinitiative.com",
-        "portswigger.net",
-        "assetnote.io",
-        "watchtowr.com",
-        "projectdiscovery.io",
-        "exploit-db.com",
-        "advisories",
-    ];
-    if lower_tags.contains("technical-description")
-        || writeup_domains.iter().any(|d| low_url.contains(d))
-    {
+    if lower_tags.contains("technical-description") {
         return ("writeup", false);
+    }
+    if let Ok(parsed) = reqwest::Url::parse(url)
+        && let Some(raw_host) = parsed.host_str()
+    {
+        let host = raw_host.to_ascii_lowercase();
+        let path = parsed.path().to_ascii_lowercase();
+        if host == "github.com" || host == "www.github.com" {
+            if path.starts_with("/advisories/") || path.contains("/security/advisories/") {
+                return ("advisory", false);
+            }
+            return ("reference", false);
+        }
+        let writeup_hosts = [
+            "medium.com",
+            "hackerone.com",
+            "huntr.com",
+            "googleprojectzero.blogspot.com",
+            "bugs.chromium.org",
+            "zerodayinitiative.com",
+            "portswigger.net",
+            "assetnote.io",
+            "watchtowr.com",
+            "projectdiscovery.io",
+            "exploit-db.com",
+        ];
+        if host.starts_with("blog.") || writeup_hosts.iter().any(|d| host_matches(&host, d)) {
+            return ("writeup", false);
+        }
     }
     ("reference", false)
 }
@@ -334,13 +346,32 @@ pub fn parse_cve5_value(
                 .map(|vs| {
                     vs.iter()
                         .filter_map(|v| {
-                            v.get("version")
-                                .or_else(|| v.get("lessThan"))
-                                .or_else(|| v.get("lessThanOrEqual"))
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
-                                .map(ToOwned::to_owned)
+                            let clean_ver = |key: &str| {
+                                v.get(key)
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("n/a"))
+                            };
+                            let start = clean_ver("version");
+                            let upper = clean_ver("lessThan")
+                                .filter(|s| *s != "*")
+                                .map(|u| format!("< {u}"))
+                                .or_else(|| {
+                                    clean_ver("lessThanOrEqual")
+                                        .filter(|s| *s != "*")
+                                        .map(|u| format!("<= {u}"))
+                                });
+                            match (start, upper) {
+                                (Some(s), Some(u))
+                                    if s == "0" || s == "*" || s.eq_ignore_ascii_case("unspecified") =>
+                                {
+                                    Some(u)
+                                }
+                                (Some(s), Some(u)) => Some(format!(">= {s}, {u}")),
+                                (None, Some(u)) => Some(u),
+                                (Some(s), None) => Some(s.to_string()),
+                                (None, None) => None,
+                            }
                         })
                         .take(10)
                         .collect()
@@ -446,6 +477,79 @@ pub fn parse_cve5_value(
     })
 }
 
+fn is_github_poc_url(url: &str, in_github_section: bool) -> bool {
+    if !in_github_section {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    if host != "github.com" && host != "www.github.com" {
+        return false;
+    }
+    let path = parsed.path().to_ascii_lowercase();
+    let non_poc_markers = [
+        "/commit/",
+        "/pull/",
+        "/issues/",
+        "/releases/",
+        "/security/advisories/",
+        "/discussions/",
+        "/wiki/",
+    ];
+    if path.starts_with("/advisories/")
+        || path.starts_with("/cveproject/")
+        || non_poc_markers.iter().any(|m| path.contains(m))
+    {
+        return false;
+    }
+    let segs: Vec<&str> = parsed.path().trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    segs.len() >= 2
+}
+
+pub fn parse_trickest_markdown(cid: &str, text: &str) -> Vec<WriteupRecord> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut in_github_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+            in_github_section = heading == "github" || heading.starts_with("github ");
+            continue;
+        }
+        for m in url_regex().find_iter(trimmed) {
+            let url = m.as_str().trim_end_matches(&['.', ',', ';'][..]);
+            if url.contains("nvd.nist.gov/vuln/detail") || url.contains("cve.mitre.org") {
+                continue;
+            }
+            if !seen.insert(url.to_string()) {
+                continue;
+            }
+            let has_patch = patch_patterns().iter().any(|p| p.is_match(url));
+            let src = if has_patch {
+                "trickest:patch"
+            } else if is_github_poc_url(url, in_github_section) {
+                "trickest:poc"
+            } else {
+                "trickest:writeup"
+            };
+            out.push(WriteupRecord {
+                cve_id: cid.to_string(),
+                source: src.to_string(),
+                url: url.to_string(),
+                title: String::new(),
+                tags: "trickest".to_string(),
+                has_patch_diff: has_patch,
+                content_excerpt: String::new(),
+            });
+        }
+    }
+    out
+}
+
 fn ingest_trickest(conn: &mut Connection, trickest_dir: &Path, existing: &HashSet<String>) -> Result<usize> {
     let md_files: Vec<PathBuf> = WalkDir::new(trickest_dir)
         .into_iter()
@@ -473,33 +577,7 @@ fn ingest_trickest(conn: &mut Connection, trickest_dir: &Path, existing: &HashSe
             let Ok(text) = fs::read_to_string(path) else {
                 return Vec::new();
             };
-            let mut out = Vec::new();
-            let mut seen = HashSet::new();
-            for m in url_regex().find_iter(&text) {
-                let url = m.as_str().trim_end_matches(&['.', ',', ';'][..]);
-                if url.contains("nvd.nist.gov/vuln/detail") || url.contains("cve.mitre.org") {
-                    continue;
-                }
-                if !seen.insert(url.to_string()) {
-                    continue;
-                }
-                let src = if url.to_lowercase().contains("github.com") {
-                    "trickest:poc"
-                } else {
-                    "trickest:writeup"
-                };
-                let has_patch = patch_patterns().iter().any(|p| p.is_match(url));
-                out.push(WriteupRecord {
-                    cve_id: cid.clone(),
-                    source: src.to_string(),
-                    url: url.to_string(),
-                    title: String::new(),
-                    tags: "trickest".to_string(),
-                    has_patch_diff: has_patch,
-                    content_excerpt: String::new(),
-                });
-            }
-            out
+            parse_trickest_markdown(&cid, &text)
         })
         .collect();
 
