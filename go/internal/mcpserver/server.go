@@ -3,21 +3,36 @@ package mcpserver
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 const maxBodyBytes = 8 << 20
 
+// Newest first. Unknown client versions get the newest one we support.
+var supportedProtocols = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
+
+func negotiateProtocol(requested string) string {
+	for _, v := range supportedProtocols {
+		if v == requested {
+			return v
+		}
+	}
+	return supportedProtocols[0]
+}
+
 type Tool struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
+	Name        string                                                      `json:"name"`
+	Description string                                                      `json:"description"`
+	InputSchema map[string]any                                              `json:"inputSchema"`
 	Handler     func(ctx context.Context, args map[string]any) (any, error) `json:"-"`
 }
 
@@ -65,6 +80,18 @@ type rpcResponse struct {
 	Error   *rpcError       `json:"error,omitempty"`
 }
 
+// callTool runs a handler and turns a panic into an ordinary error so one bad
+// tool cannot take down the whole process (matters most in stdio mode).
+func callTool(ctx context.Context, t Tool, args map[string]any) (out any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out = nil
+			err = fmt.Errorf("tool %q panicked: %v", t.Name, r)
+		}
+	}()
+	return t.Handler(ctx, args)
+}
+
 // HandleRPC processes one JSON-RPC 2.0 message. Returns (nil, true) for notifications.
 func (s *Server) HandleRPC(ctx context.Context, raw []byte) ([]byte, bool) {
 	var req rpcRequest
@@ -96,11 +123,8 @@ func (s *Server) HandleRPC(ctx context.Context, raw []byte) ([]byte, bool) {
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		_ = json.Unmarshal(req.Params, &p)
-		if p.ProtocolVersion == "" {
-			p.ProtocolVersion = "2025-11-25"
-		}
 		resp.Result = map[string]any{
-			"protocolVersion": p.ProtocolVersion,
+			"protocolVersion": negotiateProtocol(p.ProtocolVersion),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": s.Name, "version": s.Version},
 		}
@@ -128,8 +152,9 @@ func (s *Server) HandleRPC(ctx context.Context, raw []byte) ([]byte, bool) {
 		tool, ok := s.byName[p.Name]
 		s.mu.RUnlock()
 		if !ok {
+			errJSON, _ := json.Marshal(map[string]string{"error": "unknown tool: " + p.Name})
 			resp.Result = map[string]any{
-				"content": []map[string]string{{"type": "text", "text": fmt.Sprintf(`{"error":"unknown tool: %s"}`, p.Name)}},
+				"content": []map[string]string{{"type": "text", "text": string(errJSON)}},
 				"isError": true,
 			}
 			break
@@ -137,7 +162,7 @@ func (s *Server) HandleRPC(ctx context.Context, raw []byte) ([]byte, bool) {
 		if p.Arguments == nil {
 			p.Arguments = map[string]any{}
 		}
-		out, err := tool.Handler(ctx, p.Arguments)
+		out, err := callTool(ctx, tool, p.Arguments)
 		if err != nil {
 			errJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
 			resp.Result = map[string]any{
@@ -179,7 +204,33 @@ func (s *Server) ServeStdio(ctx context.Context, r io.Reader, w io.Writer) error
 	return scanner.Err()
 }
 
+// originAllowed blocks browser-driven DNS-rebinding attacks. Requests with no
+// Origin header (curl, MCP clients) pass; browser requests must come from loopback.
+func originAllowed(origin string) bool {
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+func tokenOK(r *http.Request, token string) bool {
+	if token == "" {
+		return true
+	}
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+}
+
 func (s *Server) HTTPHandler() http.Handler {
+	token := os.Getenv("MCP_AUTH_TOKEN")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -188,6 +239,14 @@ func (s *Server) HTTPHandler() http.Handler {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !originAllowed(r.Header.Get("Origin")) {
+			http.Error(w, "Forbidden origin", http.StatusForbidden)
+			return
+		}
+		if !tokenOK(r, token) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
@@ -215,7 +274,16 @@ func (s *Server) Run(transport, host string, port int) error {
 	case "http", "streamable-http":
 		addr := fmt.Sprintf("%s:%d", host, port)
 		fmt.Fprintf(os.Stderr, "[+] %s listening on http://%s/mcp\n", s.Name, addr)
-		return http.ListenAndServe(addr, s.HTTPHandler())
+		srv := &http.Server{
+			Addr:              addr,
+			Handler:           s.HTTPHandler(),
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      120 * time.Second,
+			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		}
+		return srv.ListenAndServe()
 	default:
 		return fmt.Errorf("unsupported transport %q (use stdio or http)", transport)
 	}
