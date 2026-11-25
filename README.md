@@ -73,9 +73,10 @@ flowchart TB
 
 ## Features & Components
 
-1. **Rust Ingestion, Streaming Fetcher, Offline Web UI & SBOM Scanner (`crates/nexus-sync`)**
+1. **Rust Ingestion, Streaming Fetcher, One-Command ARTEX Bootstrapper, Offline Web UI & SBOM Scanner (`crates/nexus-sync`)**
+   - `nexus-sync bootstrap --artex-url http://127.0.0.1:8787 --password <pw>`: Idempotently registers & refreshes all 4 Streamable HTTP MCPs, binds all 7 skills & MCPs across every ARTEX agent role (`planner`, `mainagent`, `worker`, `auto`, `pentest`, `reporter`, `retester`), injects ARTEX-Nexus prompts (including parallel fan-out & capture-proxy proof rules), sets turn/time safety caps, and optionally creates capture-proxy VDP header rewrite rules.
    - `nexus-sync fetch`: HTTP ETag caching (`304 Not Modified`), streaming download with on-the-fly SHA-256 verification, streaming Zstd decompression, `PRAGMA quick_check`, and atomic swap.
-   - `nexus-sync serve --port 8088`: Built-in zero-dependency **Offline CVE/OSV Web Console** (`http://127.0.0.1:8088`) to search all 227k+ CVEs, 21k+ writeups, and test SemVer package ranges in your browser.
+   - `nexus-sync serve --port 8088`: Built-in zero-dependency **Offline Intelligence & Ledger Console** (`http://127.0.0.1:8088`, CORS-enabled for `:8787/nexus`) exposing CVE/writeup FTS5 search, SemVer checks, `scope-guard-mcp` hash-chained receipts (`/api/receipts`), and local playbooks (`/api/playbooks`).
    - `nexus-sync scan --path <dir-or-lockfile> --sarif out.sarif --fail-on high`: Offline SemVer/OSV vulnerability scanner & CI gate supporting **10 formats** (`package-lock.json`, `package.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `poetry.lock`, `go.mod`, `Cargo.lock`, `composer.lock`, `pom.xml`) with **SARIF 2.1.0** export.
    - `nexus-sync init-mcp --client <antigravity|claude|cursor|zcode|freebuff|artex>`: Generates ready-to-paste MCP client JSON configs for all 4 servers.
    - `nexus-sync doctor`: Instant DB integrity, schema version, and coverage diagnostics.
@@ -83,16 +84,19 @@ flowchart TB
 2. **Rust Native `cve-intel-mcp` (`crates/cve-intel-mcp`, 9 MCP Tools)**
    - Dual transport: `stdio` + ARTEX Streamable HTTP (`POST /mcp`, protocol `2025-11-25`).
    - Tools: `search_cves`, `search_writeups`, `get_cve_details`, `match_product_cves`, `check_package_version`, `scan_dependencies`, `list_cwe_writeups`, `whats_new`, `get_kb_stats`.
-3. **Go Hardened `patch-diff-mcp` (`go/cmd/patch-diff-mcp`)**
+3. **Go Hardened `patch-diff-mcp` (`go/cmd/patch-diff-mcp`, 2 MCP Tools)**
    - Direct `api.github.com` diff endpoint (`Accept: application/vnd.github.diff`), **all HTTP redirects refused**, and DNS-resolving `DialContext` blocking loopback, RFC1918, CGNAT, and cloud metadata IPs (`169.254.169.254`).
-4. **Go Hardened `scope-guard-mcp` (`go/cmd/scope-guard-mcp`)**
-   - Symlink-safe `SCOPE_CONFIG_DIR` confinement, multi-tenant persisted `scope_id` isolation, and a cryptographically hash-chained append-only ledger (`receipts.jsonl`) verified by `verify_ledger_chain` and exportable to Markdown or SARIF 2.1.0.
-5. **Go Offline `attack-surface-mcp` (`go/cmd/attack-surface-mcp`, 3 MCP Tools)**
+4. **Go Hardened `scope-guard-mcp` (`go/cmd/scope-guard-mcp`, 6 MCP Tools)**
+   - Symlink-safe `SCOPE_CONFIG_DIR` confinement, `--default-policy` startup preload (`SCOPE_DEFAULT_POLICY`), multi-tenant persisted `scope_id` isolation, and a cryptographically hash-chained append-only ledger (`receipts.jsonl`) verified by `verify_ledger_chain` and exportable to Markdown or SARIF 2.1.0.
+5. **Go Offline `attack-surface-mcp` (`go/cmd/attack-surface-mcp`, 4 MCP Tools)**
    - `audit_openapi_spec`: Flags unauthenticated writes (`CWE-306`), BOLA/IDOR object IDs (`CWE-639`), SSRF params (`CWE-918`), and mass-assignment fields (`CWE-915`).
+   - `extract_js_endpoints`: Extracts hidden API routes, GraphQL operations, custom auth headers, Next.js `buildId`s, library version clues (for `cve-intel-mcp`), and secret candidates from downloaded SPA JS/HTML bundles offline.
    - `scan_source_sinks`: Static CWE sink & hardcoded secret scan mapped directly to `cve-intel-mcp:list_cwe_writeups`.
    - `inspect_jwt_and_headers`: Offline JWT (`alg=none`, `jku`/`x5u`/`kid`, missing `exp`) and CORS/CSP/`Set-Cookie` auditing.
-6. **Universal Skills, Playbooks & `BaaRai/ARTEX` Stack**
-   - Modular skills (`skills/*/SKILL.md`), CWE & Web/API playbooks (`knowledge/playbooks/`), CNA disclosure template (`knowledge/templates/`), and unified `docker-compose.yml` mounting `vendor/ARTEX`.
+6. **Reproducible ARTEX-Nexus Web UI Overlay (`ui-overlay/` + `scripts/build-artex-ui.{ps1,sh}`)**
+   - Builds a customized `BaaRai/ARTEX` binary (`-tags embedui`) featuring **ARTEX-Nexus** branding and a native **`/nexus`** sidebar hub (live Multi-Agent Routing Matrix, MCP tool health, inline CVE/writeup search, SemVer checker, Scope Guard hash-chain ledger, playbooks, and cost-tiered OpenAI-compatible/Vultr model presets) while keeping the `vendor/ARTEX` git submodule 100% clean.
+7. **Universal Skills, Playbooks & `BaaRai/ARTEX` Stack**
+   - 7 modular skills (`skills/*/SKILL.md` including `spa-js-endpoint-hunting`), CWE & Web/API playbooks (`knowledge/playbooks/`), CNA disclosure template (`knowledge/templates/`), and unified `docker-compose.yml` mounting `vendor/ARTEX`.
 
 ---
 

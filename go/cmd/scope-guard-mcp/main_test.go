@@ -106,3 +106,24 @@ func TestScopeConfinementMultiTenantPersistenceAndHashChain(t *testing.T) {
 		t.Fatal("expected verify_ledger_chain to detect tampering!")
 	}
 }
+
+func TestDefaultPolicyAutoload(t *testing.T) {
+	tmp := t.TempDir()
+	cfgDir := filepath.Join(tmp, "config")
+	stateDir := filepath.Join(tmp, "state")
+	if err := os.MkdirAll(cfgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(cfgDir, "lab.yaml"), []byte("program: local-lab\nin_scope:\n  - '127.0.0.1'\n  - 'localhost'\n"), 0o600)
+	gs, err := NewGuardState(cfgDir, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pol, err := gs.LoadPolicyFile("lab.yaml", "default")
+	if err != nil {
+		t.Fatalf("LoadPolicyFile failed: %v", err)
+	}
+	if pol.Program != "local-lab" || len(pol.InScope) != 2 {
+		t.Fatalf("unexpected policy loaded: %+v", pol)
+	}
+}

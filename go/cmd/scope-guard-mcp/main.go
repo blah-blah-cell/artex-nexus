@@ -235,8 +235,45 @@ func strArg(args map[string]any, key string) string {
 	return strings.TrimSpace(v)
 }
 
+func (g *GuardState) LoadPolicyFile(policyFile, sid string) (ScopePolicy, error) {
+	if strings.TrimSpace(sid) == "" {
+		sid = "default"
+	}
+	resolved, err := g.resolveConfinedPolicyPath(policyFile)
+	if err != nil {
+		return ScopePolicy{}, err
+	}
+	raw, err := os.ReadFile(resolved)
+	if err != nil {
+		return ScopePolicy{}, err
+	}
+	var pol ScopePolicy
+	if strings.HasSuffix(strings.ToLower(resolved), ".json") {
+		if err := json.Unmarshal(raw, &pol); err != nil {
+			return ScopePolicy{}, err
+		}
+	} else {
+		if err := yaml.Unmarshal(raw, &pol); err != nil {
+			return ScopePolicy{}, err
+		}
+	}
+	pol.ScopeID = sid
+	if pol.Program == "" {
+		pol.Program = strings.TrimSuffix(filepath.Base(resolved), filepath.Ext(resolved))
+	}
+
+	g.mu.Lock()
+	g.scopes[sid] = pol
+	err = g.persistScopesLocked()
+	g.mu.Unlock()
+	if err != nil {
+		return ScopePolicy{}, err
+	}
+	return pol, nil
+}
+
 func buildServer(state *GuardState) *mcpserver.Server {
-	srv := mcpserver.New("scope-guard-mcp", "0.2.0")
+	srv := mcpserver.New("scope-guard-mcp", "0.5.0")
 
 	srv.Register(mcpserver.Tool{
 		Name:        "load_scope_policy",
@@ -250,35 +287,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 			"required": []string{"policy_file"},
 		},
 		Handler: func(_ context.Context, args map[string]any) (any, error) {
-			pfile := strArg(args, "policy_file")
-			sid := scopeIDFromArgs(args)
-			resolved, err := state.resolveConfinedPolicyPath(pfile)
-			if err != nil {
-				return nil, err
-			}
-			raw, err := os.ReadFile(resolved)
-			if err != nil {
-				return nil, err
-			}
-			var pol ScopePolicy
-			if strings.HasSuffix(strings.ToLower(resolved), ".json") {
-				if err := json.Unmarshal(raw, &pol); err != nil {
-					return nil, err
-				}
-			} else {
-				if err := yaml.Unmarshal(raw, &pol); err != nil {
-					return nil, err
-				}
-			}
-			pol.ScopeID = sid
-			if pol.Program == "" {
-				pol.Program = strings.TrimSuffix(filepath.Base(resolved), filepath.Ext(resolved))
-			}
-
-			state.mu.Lock()
-			state.scopes[sid] = pol
-			err = state.persistScopesLocked()
-			state.mu.Unlock()
+			pol, err := state.LoadPolicyFile(strArg(args, "policy_file"), scopeIDFromArgs(args))
 			if err != nil {
 				return nil, err
 			}
@@ -477,7 +486,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 					"version": "2.1.0",
 					"$schema": "https://json.schemastore.org/sarif-2.1.0.json",
 					"runs": []map[string]any{{
-						"tool":    map[string]any{"driver": map[string]any{"name": "artex-nexus-scope-guard", "version": "0.2.0"}},
+						"tool":    map[string]any{"driver": map[string]any{"name": "artex-nexus-scope-guard", "version": "0.5.0"}},
 						"results": results,
 					}},
 				}
@@ -517,12 +526,23 @@ func main() {
 	port := flag.Int("port", 8903, "HTTP bind port")
 	configDir := flag.String("config-dir", envOr("SCOPE_CONFIG_DIR", "config"), "Confined directory for scope policies")
 	stateDir := flag.String("state-dir", envOr("SCOPE_STATE_DIR", "data/receipts"), "Directory for persisted scopes and hash-chained ledger")
+	defaultPolicy := flag.String("default-policy", envOr("SCOPE_DEFAULT_POLICY", ""), "Optional relative YAML/JSON policy file in config-dir to preload into 'default' scope on startup")
 	flag.Parse()
 
 	state, err := NewGuardState(*configDir, *stateDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "scope-guard-mcp init error: %v\n", err)
 		os.Exit(1)
+	}
+	if strings.TrimSpace(*defaultPolicy) != "" {
+		pol, err := state.LoadPolicyFile(*defaultPolicy, "default")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scope-guard-mcp default-policy error: %v\n", err)
+			os.Exit(1)
+		}
+		if pol.Program != "" && pol.Program != "default" {
+			_, _ = state.LoadPolicyFile(*defaultPolicy, pol.Program)
+		}
 	}
 	srv := buildServer(state)
 	if err := srv.Run(*transport, *host, *port); err != nil {

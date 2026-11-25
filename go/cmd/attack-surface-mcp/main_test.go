@@ -76,3 +76,26 @@ func TestInspectJWTAndHeaders(t *testing.T) {
 		t.Fatalf("expected >=5 JWT + header issues, got %v: %+v", res["issue_count"], res["issues"])
 	}
 }
+
+func TestExtractJSEndpoints(t *testing.T) {
+	tmp := t.TempDir()
+	js := filepath.Join(tmp, "app.chunk.js")
+	bundle := `
+	const API = "/api/v1/internal/users/{id}";
+	const NEXT = {"buildId":"build-2026-abc","next":"15.1.0"};
+	fetch("https://api.example.test/v2/orders", { headers: { "X-Internal-Auth": "1", "Authorization": "Bearer x" } });
+	const q = "mutation UpdateRole($id: ID!) { updateRole(id: $id) { ok } }";
+	const lib = "lodash@4.17.20";
+	`
+	if err := os.WriteFile(js, []byte(bundle), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := extractJSEndpoints(tmp, 50)
+	if err != nil {
+		t.Fatalf("extractJSEndpoints failed: %v", err)
+	}
+	sum := res["summary"].(map[string]int)
+	if sum["api_paths"] < 1 || sum["absolute_urls"] < 1 || sum["graphql_ops"] < 1 || sum["custom_headers"] < 2 || sum["package_versions"] < 1 {
+		t.Fatalf("expected all SPA extraction categories populated, got %+v", sum)
+	}
+}

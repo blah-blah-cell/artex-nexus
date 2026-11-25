@@ -77,6 +77,14 @@ var (
 	massAssignFieldRe = regexp.MustCompile(`(?i)^(role|roles|is_admin|isadmin|admin|permissions|scopes|verified|is_verified|balance|credits|plan|tier|owner_id|tenant_id|org_id)$`)
 	stateChangingVerb = map[string]bool{"post": true, "put": true, "patch": true, "delete": true}
 	skipDirs          = map[string]bool{".git": true, "node_modules": true, "target": true, "vendor": true, ".venv": true, "dist": true, "build": true}
+
+	jsAPIPathRe    = regexp.MustCompile(`["'` + "`" + `](/(?:api|v[0-9]+|graphql|rest|auth|oauth|oauth2|oidc|admin|internal|bff|webhook|webhooks|_next/data)[a-zA-Z0-9_\-./{}:?$&=]{1,140})["'` + "`" + `]`)
+	jsAbsURLRe     = regexp.MustCompile(`https?://[a-zA-Z0-9._\-]+(?::[0-9]+)?/[a-zA-Z0-9_\-./{}:?$&=%]{0,140}`)
+	jsGraphQLOpRe  = regexp.MustCompile(`(?i)\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{2,64})\s*[\(\{]`)
+	jsHeaderRe     = regexp.MustCompile(`["'` + "`" + `](X-[A-Za-z0-9\-]{3,40}|Authorization|X-Api-Key|Api-Key|X-CSRF-Token|X-Requested-With)["'` + "`" + `]`)
+	jsNextBuildRe  = regexp.MustCompile(`"buildId"\s*:\s*"([^"]{4,80})"`)
+	jsPkgVersionRe = regexp.MustCompile(`(?i)\b(next|react|react-dom|axios|lodash|jquery|express|angular|vue|svelte|graphql|apollo-client|jsonwebtoken|socket\.io)[/@":\s]+v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?)`)
+	jsSecretRe     = regexp.MustCompile(`(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35}|ghp_[0-9A-Za-z]{36}|sk_live_[0-9A-Za-z]{16,}|eyJ[A-Za-z0-9_\-]{12,}\.eyJ[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)`)
 )
 
 func extSet(exts ...string) map[string]bool {
@@ -432,8 +440,170 @@ func inspectJWTAndHeaders(jwtStr string, headers map[string]any) map[string]any 
 	}
 }
 
+func isNoisyURL(u string) bool {
+	lu := strings.ToLower(u)
+	for _, skip := range []string{
+		"w3.org/", "schema.org/", "reactjs.org/", "nextjs.org/", "mozilla.org/",
+		"fonts.googleapis.com/", "fonts.gstatic.com/", "purl.org/", "xmlns.com/",
+		"creativecommons.org/", "github.com/facebook/", "fb.me/",
+	} {
+		if strings.Contains(lu, skip) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractJSEndpoints(targetPath string, maxFiles int) (map[string]any, error) {
+	if maxFiles <= 0 || maxFiles > maxScanFiles {
+		maxFiles = 500
+	}
+	info, err := os.Stat(targetPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat target_path: %w", err)
+	}
+
+	jsExts := extSet(".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".html", ".htm", ".json", ".map")
+	apiPaths := map[string]bool{}
+	absURLs := map[string]bool{}
+	gqlOps := map[string]bool{}
+	headers := map[string]bool{}
+	pkgVersions := map[string]bool{}
+	buildIDs := map[string]bool{}
+	var secretHits []map[string]any
+	filesScanned := 0
+
+	processFile := func(p string) {
+		if filesScanned >= maxFiles {
+			return
+		}
+		st, err := os.Stat(p)
+		if err != nil || st.IsDir() || st.Size() > 8<<20 {
+			return
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return
+		}
+		filesScanned++
+		text := string(raw)
+
+		for _, m := range jsAPIPathRe.FindAllStringSubmatch(text, 200) {
+			if len(apiPaths) < 300 {
+				apiPaths[m[1]] = true
+			}
+		}
+		for _, u := range jsAbsURLRe.FindAllString(text, 200) {
+			if len(absURLs) < 200 && !isNoisyURL(u) {
+				absURLs[u] = true
+			}
+		}
+		for _, m := range jsGraphQLOpRe.FindAllStringSubmatch(text, 100) {
+			if len(gqlOps) < 100 {
+				gqlOps[strings.ToLower(m[1])+" "+m[2]] = true
+			}
+		}
+		for _, m := range jsHeaderRe.FindAllStringSubmatch(text, 100) {
+			if len(headers) < 80 {
+				headers[m[1]] = true
+			}
+		}
+		for _, m := range jsNextBuildRe.FindAllStringSubmatch(text, 10) {
+			buildIDs[m[1]] = true
+		}
+		for _, m := range jsPkgVersionRe.FindAllStringSubmatch(text, 50) {
+			if len(pkgVersions) < 80 {
+				pkgVersions[strings.ToLower(m[1])+"@"+m[2]] = true
+			}
+		}
+		if len(secretHits) < 50 {
+			for _, m := range jsSecretRe.FindAllString(text, 10) {
+				redacted := m
+				if len(redacted) > 24 {
+					redacted = redacted[:12] + "..." + redacted[len(redacted)-6:]
+				}
+				secretHits = append(secretHits, map[string]any{
+					"file":    p,
+					"preview": redacted,
+					"cwe":     "CWE-798",
+				})
+				if len(secretHits) >= 50 {
+					break
+				}
+			}
+		}
+	}
+
+	if !info.IsDir() {
+		processFile(targetPath)
+	} else {
+		_ = filepath.WalkDir(targetPath, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if skipDirs[d.Name()] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if filesScanned >= maxFiles {
+				return fs.SkipAll
+			}
+			if !jsExts[strings.ToLower(filepath.Ext(p))] {
+				return nil
+			}
+			processFile(p)
+			return nil
+		})
+	}
+
+	toSorted := func(m map[string]bool) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		// deterministic lexicographic sort without extra imports
+		for i := 0; i < len(out); i++ {
+			for j := i + 1; j < len(out); j++ {
+				if out[j] < out[i] {
+					out[i], out[j] = out[j], out[i]
+				}
+			}
+		}
+		return out
+	}
+
+	pathsList := toSorted(apiPaths)
+	urlsList := toSorted(absURLs)
+	gqlList := toSorted(gqlOps)
+	hdrList := toSorted(headers)
+	pkgList := toSorted(pkgVersions)
+	buildList := toSorted(buildIDs)
+
+	return map[string]any{
+		"target_path":      targetPath,
+		"files_scanned":    filesScanned,
+		"api_paths":        pathsList,
+		"absolute_urls":    urlsList,
+		"graphql_ops":      gqlList,
+		"custom_headers":   hdrList,
+		"package_versions": pkgList,
+		"next_build_ids":   buildList,
+		"secret_candidates": secretHits,
+		"summary": map[string]int{
+			"api_paths":         len(pathsList),
+			"absolute_urls":     len(urlsList),
+			"graphql_ops":       len(gqlList),
+			"custom_headers":    len(hdrList),
+			"package_versions":  len(pkgList),
+			"secret_candidates": len(secretHits),
+		},
+	}, nil
+}
+
 func buildServer() *mcpserver.Server {
-	srv := mcpserver.New("attack-surface-mcp", "0.4.0")
+	srv := mcpserver.New("attack-surface-mcp", "0.5.0")
 
 	srv.Register(mcpserver.Tool{
 		Name:        "audit_openapi_spec",
@@ -486,6 +656,27 @@ func buildServer() *mcpserver.Server {
 			jwtStr, _ := args["jwt"].(string)
 			hdrs, _ := args["headers"].(map[string]any)
 			return inspectJWTAndHeaders(jwtStr, hdrs), nil
+		},
+	})
+
+	srv.Register(mcpserver.Tool{
+		Name:        "extract_js_endpoints",
+		Description: "Extract hidden API routes, GraphQL operations, custom auth headers, Next.js buildIds, library version clues (for cve-intel-mcp), and secret candidates from downloaded JS/HTML/JSON SPA bundles offline.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"target_path": map[string]any{"type": "string", "description": "File or directory containing downloaded JS/HTML/JSON bundles"},
+				"max_files":   map[string]any{"type": "integer", "default": 500},
+			},
+			"required": []string{"target_path"},
+		},
+		Handler: func(_ context.Context, args map[string]any) (any, error) {
+			p, _ := args["target_path"].(string)
+			maxF := 500
+			if f, ok := args["max_files"].(float64); ok {
+				maxF = int(f)
+			}
+			return extractJSEndpoints(strings.TrimSpace(p), maxF)
 		},
 	})
 

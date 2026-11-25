@@ -1,3 +1,5 @@
+mod bootstrap;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -125,7 +127,7 @@ enum Command {
         #[arg(long, default_value = ".")]
         repo_root: PathBuf,
     },
-    /// Launch local offline Web Dashboard for browsing CVEs, writeup text, and OSV SemVer checks
+    /// Launch local offline Web Dashboard for browsing CVEs, writeups, SemVer checks, receipts, and playbooks
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -133,6 +135,49 @@ enum Command {
         port: u16,
         #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
         db: PathBuf,
+        #[arg(long, env = "SCOPE_STATE_DIR", default_value = "data/receipts")]
+        receipts_dir: PathBuf,
+        #[arg(long, default_value = "knowledge")]
+        knowledge_dir: PathBuf,
+    },
+    /// Auto-configure a running ARTEX instance with all 4 ARTEX-Nexus MCPs, 7 skills, role prompts, caps, and headers
+    Bootstrap {
+        #[arg(long, env = "ARTEX_URL", default_value = "http://127.0.0.1:8787")]
+        artex_url: String,
+        #[arg(long, env = "ARTEX_UI_PASSWORD", default_value = "")]
+        password: String,
+        #[arg(long, env = "ARTEX_SETUP_TOKEN")]
+        setup_token: Option<String>,
+        #[arg(long, default_value = "127.0.0.1")]
+        mcp_host: String,
+        #[arg(long, help = "Use Docker Compose service hostnames for MCP URLs")]
+        docker_network: bool,
+        #[arg(long, default_value = "/opt/artex-nexus-knowledge")]
+        knowledge_dir: String,
+        #[arg(long, default_value = "/data")]
+        data_dir: String,
+        #[arg(long, default_value = "/config")]
+        config_dir: String,
+        #[arg(long, default_value = "http://127.0.0.1:8788")]
+        proxy_url: String,
+        #[arg(long, help = "LLM profile ID to bind to planner and mainagent")]
+        planner_profile_id: Option<i64>,
+        #[arg(long, help = "LLM profile ID to bind to worker/goals/auto/pentest/reporter/retester and global default")]
+        worker_profile_id: Option<i64>,
+        #[arg(long, default_value_t = 15)]
+        reporter_max_turns: i64,
+        #[arg(long, default_value_t = 300)]
+        reporter_run_seconds: i64,
+        #[arg(long, default_value_t = 25)]
+        retester_max_turns: i64,
+        #[arg(long, default_value_t = 600)]
+        retester_run_seconds: i64,
+        #[arg(long, help = "Optional host matcher for capture-proxy rewrite rule (e.g. *.example.com)")]
+        rewrite_host: Option<String>,
+        #[arg(long, help = "Optional header to inject via capture proxy (e.g. X-Intigriti-Username: handle)")]
+        rewrite_header: Option<String>,
+        #[arg(long, help = "Print bootstrap plan without modifying ARTEX")]
+        dry_run: bool,
     },
 }
 
@@ -2175,14 +2220,103 @@ fn api_package_check(db_path: &Path, params: &HashMap<String, String>) -> Result
 
 fn json_response(status: u16, body: Value) -> Response<std::io::Cursor<Vec<u8>>> {
     let hdr = Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap();
+    let cors = Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap();
     Response::from_string(body.to_string())
         .with_status_code(status)
         .with_header(hdr)
+        .with_header(cors)
 }
 
-fn serve_dashboard(server: Arc<Server>, db_path: PathBuf) {
+fn api_receipts(receipts_dir: &Path) -> Result<Value> {
+    let ledger_path = receipts_dir.join("receipts.jsonl");
+    if !ledger_path.exists() {
+        return Ok(json!({"count": 0, "chain_valid": true, "receipts": []}));
+    }
+    let raw = fs::read_to_string(&ledger_path)?;
+    let mut entries = Vec::new();
+    let mut expected_prev = "GENESIS".to_string();
+    let mut chain_valid = true;
+    for (idx, line) in raw.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: Value = serde_json::from_str(trimmed)?;
+        let prev = val.get("prev_sha256").and_then(|v| v.as_str()).unwrap_or("");
+        let seq = val.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        if seq != (idx as u64) + 1 || prev != expected_prev {
+            chain_valid = false;
+        }
+        expected_prev = val
+            .get("sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        entries.push(val);
+    }
+    Ok(json!({
+        "count": entries.len(),
+        "chain_valid": chain_valid,
+        "head_sha256": expected_prev,
+        "receipts": entries,
+    }))
+}
+
+fn api_playbooks(knowledge_dir: &Path) -> Result<Value> {
+    let mut items = Vec::new();
+    if knowledge_dir.exists() {
+        for entry in WalkDir::new(knowledge_dir).max_depth(3).into_iter().flatten() {
+            if entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+            {
+                let rel = entry
+                    .path()
+                    .strip_prefix(knowledge_dir)
+                    .unwrap_or(entry.path())
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                let title = text
+                    .lines()
+                    .find(|l| l.starts_with('#'))
+                    .map(|l| l.trim_start_matches('#').trim().to_string())
+                    .unwrap_or_else(|| rel.clone());
+                items.push(json!({
+                    "path": rel,
+                    "title": title,
+                    "bytes": text.len(),
+                    "preview": text.chars().take(600).collect::<String>(),
+                }));
+            }
+        }
+    }
+    Ok(json!({"count": items.len(), "playbooks": items}))
+}
+
+fn serve_dashboard(
+    server: Arc<Server>,
+    db_path: PathBuf,
+    receipts_dir: PathBuf,
+    knowledge_dir: PathBuf,
+) {
     for request in server.incoming_requests() {
-        if *request.method() != Method::Get {
+        if *request.method() == Method::Options {
+            let cors = Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap();
+            let methods = Header::from_bytes("Access-Control-Allow-Methods", "GET, OPTIONS").unwrap();
+            let _ = request.respond(
+                Response::from_string("")
+                    .with_status_code(204)
+                    .with_header(cors)
+                    .with_header(methods),
+            );
+            continue;
+        }
+        if *request.method() != Method::Get && *request.method() != Method::Head {
             let _ = request.respond(Response::from_string("Method Not Allowed").with_status_code(405));
             continue;
         }
@@ -2205,6 +2339,14 @@ fn serve_dashboard(server: Arc<Server>, db_path: PathBuf) {
                 Ok(v) => json_response(200, v),
                 Err(e) => json_response(500, json!({"error": e.to_string()})),
             },
+            "/api/receipts" => match api_receipts(&receipts_dir) {
+                Ok(v) => json_response(200, v),
+                Err(e) => json_response(500, json!({"error": e.to_string()})),
+            },
+            "/api/playbooks" => match api_playbooks(&knowledge_dir) {
+                Ok(v) => json_response(200, v),
+                Err(e) => json_response(500, json!({"error": e.to_string()})),
+            },
             p if p.starts_with("/api/cve/") => {
                 let cid = p.trim_start_matches("/api/cve/");
                 match api_cve_detail(&db_path, cid) {
@@ -2218,12 +2360,18 @@ fn serve_dashboard(server: Arc<Server>, db_path: PathBuf) {
     }
 }
 
-fn cmd_serve(host: &str, port: u16, db_path: PathBuf) -> Result<()> {
+fn cmd_serve(
+    host: &str,
+    port: u16,
+    db_path: PathBuf,
+    receipts_dir: PathBuf,
+    knowledge_dir: PathBuf,
+) -> Result<()> {
     let _ = open_readonly(&db_path)?;
     let addr = format!("{host}:{port}");
     let server = Arc::new(Server::http(&addr).map_err(|e| anyhow::anyhow!("binding {addr}: {e}"))?);
     eprintln!("[+] ARTEX-Nexus Offline Web Console listening on http://{addr}");
-    serve_dashboard(server, db_path);
+    serve_dashboard(server, db_path, receipts_dir, knowledge_dir);
     Ok(())
 }
 
@@ -2317,7 +2465,55 @@ fn main() -> Result<()> {
         } => cmd_scan(&path, &db, json, sarif.as_deref(), fail_on)?,
         Command::Doctor { db } => cmd_doctor(&db)?,
         Command::InitMcp { client, repo_root } => cmd_init_mcp(client, &repo_root)?,
-        Command::Serve { host, port, db } => cmd_serve(&host, port, db)?,
+        Command::Serve {
+            host,
+            port,
+            db,
+            receipts_dir,
+            knowledge_dir,
+        } => cmd_serve(&host, port, db, receipts_dir, knowledge_dir)?,
+        Command::Bootstrap {
+            artex_url,
+            password,
+            setup_token,
+            mcp_host,
+            docker_network,
+            knowledge_dir,
+            data_dir,
+            config_dir,
+            proxy_url,
+            planner_profile_id,
+            worker_profile_id,
+            reporter_max_turns,
+            reporter_run_seconds,
+            retester_max_turns,
+            retester_run_seconds,
+            rewrite_host,
+            rewrite_header,
+            dry_run,
+        } => {
+            let out = bootstrap::cmd_bootstrap(&bootstrap::BootstrapConfig {
+                artex_url,
+                password,
+                setup_token,
+                mcp_host,
+                docker_network,
+                knowledge_dir,
+                data_dir,
+                config_dir,
+                proxy_url,
+                planner_profile_id,
+                worker_profile_id,
+                reporter_max_turns,
+                reporter_run_seconds,
+                retester_max_turns,
+                retester_run_seconds,
+                rewrite_host,
+                rewrite_header,
+                dry_run,
+            })?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
     }
     Ok(())
 }
@@ -2533,7 +2729,12 @@ mod tests {
         let addr = server.server_addr().to_ip().unwrap();
         let srv_clone = Arc::clone(&server);
         let db_clone = db.clone();
-        std::thread::spawn(move || serve_dashboard(srv_clone, db_clone));
+        let receipts_dir = dir.path().join("receipts");
+        let knowledge_dir = dir.path().join("knowledge");
+        fs::create_dir_all(&receipts_dir).unwrap();
+        fs::create_dir_all(&knowledge_dir).unwrap();
+        fs::write(knowledge_dir.join("demo-playbook.md"), "# Demo Playbook\nCheck BOLA.\n").unwrap();
+        std::thread::spawn(move || serve_dashboard(srv_clone, db_clone, receipts_dir, knowledge_dir));
 
         let client = Client::new();
         let html = client.get(format!("http://{addr}/")).send().unwrap().text().unwrap();
@@ -2568,6 +2769,54 @@ mod tests {
         assert_eq!(pkg["vulnerable"], true);
         assert_eq!(pkg["count"], 1);
 
+        let receipts: Value = client
+            .get(format!("http://{addr}/api/receipts"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(receipts["chain_valid"], true);
+
+        let playbooks: Value = client
+            .get(format!("http://{addr}/api/playbooks"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(playbooks["count"], 1);
+
         server.unblock();
+    }
+
+    #[test]
+    fn bootstrap_prompt_merge_is_idempotent_and_dry_run_works() {
+        let cfg = bootstrap::BootstrapConfig {
+            artex_url: "http://127.0.0.1:8787".to_string(),
+            password: "test".to_string(),
+            setup_token: None,
+            mcp_host: "127.0.0.1".to_string(),
+            docker_network: false,
+            knowledge_dir: "/opt/knowledge".to_string(),
+            data_dir: "/data".to_string(),
+            config_dir: "/config".to_string(),
+            proxy_url: "http://127.0.0.1:8788".to_string(),
+            planner_profile_id: Some(3),
+            worker_profile_id: Some(2),
+            reporter_max_turns: 15,
+            reporter_run_seconds: 300,
+            retester_max_turns: 25,
+            retester_run_seconds: 600,
+            rewrite_host: None,
+            rewrite_header: None,
+            dry_run: true,
+        };
+        let dry = bootstrap::cmd_bootstrap(&cfg).unwrap();
+        assert_eq!(dry["dry_run"], true);
+        let block = bootstrap::build_role_context("planner", &cfg).unwrap();
+        assert!(block.contains("extract_js_endpoints"));
+        assert!(block.contains("2–3 non-overlapping intents"));
+        let once = bootstrap::merge_prompt("Base prompt.", &block);
+        let twice = bootstrap::merge_prompt(&once, &block);
+        assert_eq!(once, twice);
     }
 }

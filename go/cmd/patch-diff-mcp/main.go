@@ -213,7 +213,7 @@ func checkHints(file, op, rawLine string, signals *[]securitySignal) {
 }
 
 func buildServer(client *http.Client) *mcpserver.Server {
-	srv := mcpserver.New("patch-diff-mcp", "0.2.0")
+	srv := mcpserver.New("patch-diff-mcp", "0.5.0")
 
 	srv.Register(mcpserver.Tool{
 		Name:        "fetch_cve_patch_diff",
