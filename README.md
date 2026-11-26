@@ -73,34 +73,40 @@ flowchart TB
 
 ## Quick Start
 
+Full setup, environment variables, and troubleshooting (for both humans and coding agents) live in [SETUP.md](SETUP.md).
+
 Clone with the upstream `BaaRai/ARTEX` submodule:
 ```bash
 git clone --recurse-submodules https://github.com/blah-blah-cell/artex-nexus.git
 cd artex-nexus
 ```
 
-Build binaries and pull the latest CVE database:
+### One-Command Install (Builds Binaries, Generates `.env`, Fetches & Verifies CVE DB)
 ```bash
-make build
-./target/release/nexus-sync fetch
-./target/release/nexus-sync doctor
+# Linux / macOS (native binaries + CVE DB)
+./scripts/install.sh --client claude    # antigravity | claude | cursor | zcode | freebuff | artex
 
-# Local web console (http://127.0.0.1:8088)
+# Windows PowerShell
+.\scripts\install.ps1 -Client claude
+
+# Full Docker Compose stack (Postgres + ARTEX + 4 HTTP MCPs + Web Console)
+./scripts/install.sh --mode docker      # or .\scripts\install.ps1 -Mode docker
+```
+
+### Common Commands
+```bash
+# Start / check / stop all 4 HTTP MCP servers + local web console (Linux / macOS)
+./scripts/start-mcps.sh start
+./scripts/start-mcps.sh status
+
+# Run just the local web console (http://127.0.0.1:8088)
 ./target/release/nexus-sync serve
 
-# Offline lockfile scan + SARIF output
+# Offline lockfile scan + SARIF 2.1.0 output
 ./target/release/nexus-sync scan --path . --sarif sbom.sarif --fail-on high
-```
 
-Run the Docker Compose stack (Postgres, ARTEX, all 4 MCP servers, and the local console):
-```bash
-cp .env.example .env   # set POSTGRES_PASSWORD
-docker compose up -d --build
-```
-
-Generate stdio config for your editor or CLI agent:
-```bash
-./target/release/nexus-sync init-mcp --client claude   # antigravity | cursor | zcode | freebuff | artex
+# Print stdio MCP config JSON for any supported client
+./target/release/nexus-sync init-mcp --client claude
 ```
 
 ## Found a Bug With This?

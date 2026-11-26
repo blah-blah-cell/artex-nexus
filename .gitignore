@@ -16,6 +16,7 @@ data/*.sqlite.tmp
 data/*.sqlite.building
 data/.cache/
 data/receipts/
+.run/
 .tmp/
 
 # Secrets and local environment overrides
