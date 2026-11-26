@@ -13,16 +13,9 @@ Only run this against systems you own or have explicit scope to test. See [SECUR
 
 ## CVE Database Snapshot (`cve-db-latest`)
 
-GitHub Actions rebuilds the SQLite database nightly from `CVEProject/cvelistV5`, CISA KEV, FIRST EPSS, `github/advisory-database` (OSV/GHSA), `trickest/cve`, and `nuclei-templates`. Unscored KEV records keep `cvss_score = NULL` with `cvss_severity = KEV_UNSCORED` rather than inventing a score.
+GitHub Actions rebuilds the SQLite database nightly from `CVEProject/cvelistV5`, CISA KEV, FIRST EPSS, `github/advisory-database` (OSV/GHSA), `trickest/cve`, and `nuclei-templates`, runs a row-count and `PRAGMA quick_check` sanity gate, and records exact upstream commit SHAs in the release notes. Unscored KEV records keep `cvss_score = NULL` with `cvss_severity = KEV_UNSCORED` rather than inventing a score.
 
-| Metric | Approximate Count |
-|---|---|
-| Medium+ CVEs (CVSS >= 4.0 + unscored KEV) | 228k+ |
-| CISA KEV entries | 1,790+ |
-| Reference / advisory / patch links | 1.05M+ |
-| Indexed GHSA/OSV writeup bodies (`writeups_fts`) | 21.8k+ |
-| OSV/GHSA package version ranges | 43.2k+ |
-| Local FTS5 query time (`cve-intel-mcp`) | ~1–2 ms |
+Run `nexus-sync doctor` (or the `get_kb_stats` MCP tool) against your downloaded database to inspect live counts for Medium+ CVEs, CISA KEV entries, writeup excerpts (`writeups_fts`), and OSV/GHSA package version ranges.
 
 ## Layout
 

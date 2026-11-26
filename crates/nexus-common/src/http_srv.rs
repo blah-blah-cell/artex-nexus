@@ -39,7 +39,10 @@ impl HttpResponse {
     pub fn text(status: u16, msg: impl Into<String>) -> Self {
         Self {
             status,
-            headers: vec![("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            )],
             body: msg.into().into_bytes(),
         }
     }
@@ -47,7 +50,10 @@ impl HttpResponse {
     pub fn html(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
-            headers: vec![("Content-Type".to_string(), "text/html; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "text/html; charset=utf-8".to_string(),
+            )],
             body: body.into().into_bytes(),
         }
     }
@@ -55,7 +61,10 @@ impl HttpResponse {
     pub fn json(status: u16, val: &Value) -> Self {
         Self {
             status,
-            headers: vec![("Content-Type".to_string(), "application/json; charset=utf-8".to_string())],
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/json; charset=utf-8".to_string(),
+            )],
             body: val.to_string().into_bytes(),
         }
     }
@@ -76,7 +85,11 @@ impl HttpResponse {
                 builder = builder.header(hn, hv);
             }
         }
-        let payload = if strip_body { Bytes::new() } else { Bytes::from(self.body) };
+        let payload = if strip_body {
+            Bytes::new()
+        } else {
+            Bytes::from(self.body)
+        };
         builder
             .body(Full::new(payload))
             .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
@@ -294,7 +307,8 @@ mod tests {
             request_timeout: Duration::from_secs(2),
             max_concurrent: 8,
         };
-        let mut srv = spawn_http_server("127.0.0.1:0", cfg, |_req| HttpResponse::text(200, "ok")).unwrap();
+        let mut srv =
+            spawn_http_server("127.0.0.1:0", cfg, |_req| HttpResponse::text(200, "ok")).unwrap();
 
         // Oversized body must get 413.
         let mut s1 = TcpStream::connect(srv.addr).unwrap();
@@ -308,7 +322,10 @@ mod tests {
         .unwrap();
         let mut resp1 = String::new();
         let _ = s1.read_to_string(&mut resp1);
-        assert!(resp1.starts_with("HTTP/1.1 413"), "expected 413, got: {resp1}");
+        assert!(
+            resp1.starts_with("HTTP/1.1 413"),
+            "expected 413, got: {resp1}"
+        );
 
         // Stalled incomplete headers must be closed by header_read_timeout.
         let mut s2 = TcpStream::connect(srv.addr).unwrap();
@@ -316,7 +333,10 @@ mod tests {
         write!(s2, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
         let mut buf = [0u8; 64];
         let n = s2.read(&mut buf).unwrap_or(0);
-        assert_eq!(n, 0, "expected stalled connection to close after header timeout");
+        assert_eq!(
+            n, 0,
+            "expected stalled connection to close after header timeout"
+        );
 
         srv.stop();
     }

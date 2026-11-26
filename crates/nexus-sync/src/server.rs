@@ -1,28 +1,27 @@
 use anyhow::Result;
 use http::{HeaderValue, Method, header};
-use nexus_common::http_srv::{
-    HttpRequest, HttpResponse, ServerConfig, serve_http_blocking,
-};
+use nexus_common::http_srv::{HttpRequest, HttpResponse, ServerConfig, serve_http_blocking};
 #[cfg(test)]
 use nexus_common::http_srv::{RunningServer, spawn_http_server};
 use nexus_common::open_readonly;
 use nexus_common::queries::{
-    CachedDb, SearchCveOpts, norm_cwe, query_cve_details, query_kb_stats, query_package_vulns,
-    query_search_cves, query_search_writeups, with_cached_db,
+    CachedDb, SearchCveOpts, norm_cwe, query_cve_details, query_kb_stats,
+    query_package_vulns_detailed, query_search_cves, query_search_writeups, with_cached_db,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
+use serde_json::ser::Formatter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime};
 use walkdir::WalkDir;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+const CONSOLE_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
 
 /// Field order matches Go's `scope-guard-mcp` LedgerEntry so JSON serialization
 /// produces identical bytes for SHA-256 verification.
@@ -45,23 +44,11 @@ pub struct LedgerEntry {
     pub sha256: String,
 }
 
-/// Formatter matching Go's `encoding/json.Marshal` escaping (`\u0008`, `\u000c`,
-/// `\u0026`, `\u003c`, `\u003e`, `\u2028`, `\u2029`).
+/// Formatter matching Go 1.22+ `encoding/json.Marshal` escaping (`\b`, `\f` via default
+/// `serde_json::ser::Formatter`, plus HTML/JS-safe `\u0026`, `\u003c`, `\u003e`, `\u2028`, `\u2029`).
 struct GoJsonFormatter;
 
 impl Formatter for GoJsonFormatter {
-    fn write_char_escape<W: ?Sized + io::Write>(
-        &mut self,
-        writer: &mut W,
-        char_escape: CharEscape,
-    ) -> io::Result<()> {
-        match char_escape {
-            CharEscape::Backspace => writer.write_all(b"\\u0008"),
-            CharEscape::FormFeed => writer.write_all(b"\\u000c"),
-            other => CompactFormatter.write_char_escape(writer, other),
-        }
-    }
-
     fn write_string_fragment<W: ?Sized + io::Write>(
         &mut self,
         writer: &mut W,
@@ -266,9 +253,17 @@ fn api_search(db: &mut CachedDb, params: &HashMap<String, String>) -> Result<Val
 
 fn api_package_check(db: &mut CachedDb, params: &HashMap<String, String>) -> Result<Value> {
     let start = Instant::now();
-    let eco = params.get("ecosystem").map(String::as_str).unwrap_or("").trim();
+    let eco = params
+        .get("ecosystem")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
     let name = params.get("name").map(String::as_str).unwrap_or("").trim();
-    let ver = params.get("version").map(String::as_str).unwrap_or("").trim();
+    let ver = params
+        .get("version")
+        .map(String::as_str)
+        .unwrap_or("")
+        .trim();
     if eco.is_empty() || name.is_empty() || ver.is_empty() {
         return Ok(json!({"error": "ecosystem, name, and version are required."}));
     }
@@ -276,22 +271,80 @@ fn api_package_check(db: &mut CachedDb, params: &HashMap<String, String>) -> Res
     if schema < 2 {
         return Ok(json!({"error": "Package checking requires schema v2 DB."}));
     }
-    let vulns = query_package_vulns(conn, eco, name, ver)?;
+    let report = query_package_vulns_detailed(conn, eco, name, ver)?;
+    let status = if !report.vulnerabilities.is_empty() {
+        "vulnerable"
+    } else if report.installed_unparseable || report.unverifiable_ranges > 0 {
+        "unverifiable"
+    } else {
+        "no_known_match"
+    };
     Ok(json!({
         "ecosystem": eco,
         "package_name": name,
         "installed_version": ver,
-        "vulnerable": !vulns.is_empty(),
-        "count": vulns.len(),
+        "status": status,
+        "vulnerable": !report.vulnerabilities.is_empty(),
+        "installed_unparseable": report.installed_unparseable,
+        "unverifiable_ranges": report.unverifiable_ranges,
+        "count": report.vulnerabilities.len(),
         "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
-        "vulnerabilities": vulns
+        "vulnerabilities": report.vulnerabilities
     }))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct LedgerStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn ledger_stamp(path: &Path) -> Option<LedgerStamp> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    Some(LedgerStamp {
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        #[cfg(unix)]
+        ino,
+    })
+}
+
+#[derive(Default)]
+struct ReceiptsCache {
+    stamp: Option<LedgerStamp>,
+    value: Option<Value>,
+}
+
+fn api_receipts_cached(receipts_dir: &Path, cache: &Mutex<ReceiptsCache>) -> Result<Value> {
+    let ledger_path = receipts_dir.join("receipts.jsonl");
+    let cur_stamp = ledger_stamp(&ledger_path);
+    if let Ok(guard) = cache.lock()
+        && guard.stamp == cur_stamp
+        && let Some(ref val) = guard.value
+    {
+        return Ok(val.clone());
+    }
+    let fresh = api_receipts(receipts_dir)?;
+    if let Ok(mut guard) = cache.lock() {
+        guard.stamp = cur_stamp;
+        guard.value = Some(fresh.clone());
+    }
+    Ok(fresh)
 }
 
 pub fn api_receipts(receipts_dir: &Path) -> Result<Value> {
     let ledger_path = receipts_dir.join("receipts.jsonl");
     if !ledger_path.exists() {
-        return Ok(json!({"count": 0, "chain_valid": true, "head_sha256": "GENESIS", "receipts": []}));
+        return Ok(
+            json!({"count": 0, "chain_valid": true, "head_sha256": "GENESIS", "receipts": []}),
+        );
     }
     let raw = fs::read_to_string(&ledger_path)?;
     let mut entries = Vec::new();
@@ -313,7 +366,10 @@ pub fn api_receipts(receipts_dir: &Path) -> Result<Value> {
             }
         };
         let recomputed = compute_ledger_hash(&entry).unwrap_or_default();
-        if entry.seq != entry_num || entry.prev_sha256 != expected_prev || entry.sha256 != recomputed {
+        if entry.seq != entry_num
+            || entry.prev_sha256 != expected_prev
+            || entry.sha256 != recomputed
+        {
             chain_valid = false;
         }
         expected_prev = entry.sha256.clone();
@@ -330,7 +386,11 @@ pub fn api_receipts(receipts_dir: &Path) -> Result<Value> {
 fn api_playbooks(knowledge_dir: &Path) -> Result<Value> {
     let mut items = Vec::new();
     if knowledge_dir.exists() {
-        for entry in WalkDir::new(knowledge_dir).max_depth(3).into_iter().flatten() {
+        for entry in WalkDir::new(knowledge_dir)
+            .max_depth(3)
+            .into_iter()
+            .flatten()
+        {
             if entry.file_type().is_file()
                 && entry
                     .path()
@@ -363,8 +423,15 @@ fn api_playbooks(knowledge_dir: &Path) -> Result<Value> {
     Ok(json!({"count": items.len(), "playbooks": items}))
 }
 
+fn with_security_headers(resp: HttpResponse) -> HttpResponse {
+    resp.with_header("X-Content-Type-Options", "nosniff")
+        .with_header("X-Frame-Options", "DENY")
+        .with_header("Referrer-Policy", "no-referrer")
+        .with_header("Content-Security-Policy", CONSOLE_CSP)
+}
+
 fn json_response(status: u16, body: Value, cors_origin: Option<&str>) -> HttpResponse {
-    let mut resp = HttpResponse::json(status, &body);
+    let mut resp = with_security_headers(HttpResponse::json(status, &body));
     if let Some(origin) = cors_origin {
         resp = resp
             .with_header("Access-Control-Allow-Origin", origin)
@@ -377,6 +444,7 @@ fn handle_dashboard_request(
     req: HttpRequest,
     db_path: &Path,
     receipts_dir: &Path,
+    receipts_cache: &Mutex<ReceiptsCache>,
     knowledge_dir: &Path,
     allowed_origins: &[String],
     allowed_hosts: &HashSet<String>,
@@ -385,7 +453,7 @@ fn handle_dashboard_request(
     if let Some(host) = extract_host_header(&req)
         && !allowed_hosts.contains(&host)
     {
-        return HttpResponse::text(403, "Forbidden host");
+        return with_security_headers(HttpResponse::text(403, "Forbidden host"));
     }
 
     let origin_check = check_origin(&req, allowed_origins);
@@ -394,15 +462,17 @@ fn handle_dashboard_request(
         OriginCheck::None => None,
         OriginCheck::Forbidden => {
             if req.method == Method::OPTIONS || req.uri.starts_with("/api/") {
-                return HttpResponse::text(403, "Forbidden origin");
+                return with_security_headers(HttpResponse::text(403, "Forbidden origin"));
             }
             None
         }
     };
 
     if req.method == Method::OPTIONS {
-        let mut resp = HttpResponse::empty(204)
-            .with_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+        let mut resp = with_security_headers(
+            HttpResponse::empty(204)
+                .with_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
+        );
         if let Some(origin) = cors {
             resp = resp
                 .with_header("Access-Control-Allow-Origin", origin)
@@ -411,13 +481,13 @@ fn handle_dashboard_request(
         return resp;
     }
     if req.method != Method::GET && req.method != Method::HEAD {
-        return HttpResponse::text(405, "Method Not Allowed");
+        return with_security_headers(HttpResponse::text(405, "Method Not Allowed"));
     }
 
     let full_url = req.uri.clone();
     let (path, qparams) = parse_query_params(&full_url);
     match path {
-        "/" | "/index.html" => HttpResponse::html(200, DASHBOARD_HTML),
+        "/" | "/index.html" => with_security_headers(HttpResponse::html(200, DASHBOARD_HTML)),
         "/api/stats" => match with_cached_db(db_path, |db| {
             let (c, s) = db.connection()?;
             query_kb_stats(c, s)
@@ -433,7 +503,7 @@ fn handle_dashboard_request(
             Ok(v) => json_response(200, v, cors),
             Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
         },
-        "/api/receipts" => match api_receipts(receipts_dir) {
+        "/api/receipts" => match api_receipts_cached(receipts_dir, receipts_cache) {
             Ok(v) => json_response(200, v, cors),
             Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
         },
@@ -451,7 +521,7 @@ fn handle_dashboard_request(
                 Err(e) => json_response(500, json!({"error": e.to_string()}), cors),
             }
         }
-        _ => HttpResponse::text(404, "Not Found"),
+        _ => with_security_headers(HttpResponse::text(404, "Not Found")),
     }
 }
 
@@ -474,10 +544,19 @@ pub fn spawn_dashboard(
     let hosts = Arc::new(build_allowed_hosts(&origins));
     let db_path = Arc::new(db_path);
     let receipts_dir = Arc::new(receipts_dir);
+    let receipts_cache = Arc::new(Mutex::new(ReceiptsCache::default()));
     let knowledge_dir = Arc::new(knowledge_dir);
 
     spawn_http_server(bind_addr, ServerConfig::default(), move |req| {
-        handle_dashboard_request(req, &db_path, &receipts_dir, &knowledge_dir, &origins, &hosts)
+        handle_dashboard_request(
+            req,
+            &db_path,
+            &receipts_dir,
+            &receipts_cache,
+            &knowledge_dir,
+            &origins,
+            &hosts,
+        )
     })
 }
 
@@ -507,10 +586,19 @@ pub fn cmd_serve(
     let hosts = Arc::new(build_allowed_hosts(&origins));
     let db_path = Arc::new(db_path);
     let receipts_dir = Arc::new(receipts_dir);
+    let receipts_cache = Arc::new(Mutex::new(ReceiptsCache::default()));
     let knowledge_dir = Arc::new(knowledge_dir);
 
     eprintln!("[+] ARTEX-Nexus Web Console listening on http://{addr}");
     serve_http_blocking(&addr, ServerConfig::default(), move |req| {
-        handle_dashboard_request(req, &db_path, &receipts_dir, &knowledge_dir, &origins, &hosts)
+        handle_dashboard_request(
+            req,
+            &db_path,
+            &receipts_dir,
+            &receipts_cache,
+            &knowledge_dir,
+            &origins,
+            &hosts,
+        )
     })
 }

@@ -36,9 +36,18 @@ export function SemverTab({ nexusUrl, totalPackages }: SemverTabProps) {
       }
       const list: PkgVuln[] = Array.isArray(data.vulnerabilities) ? data.vulnerabilities : [];
       setPkgVulns(list);
-      setPkgStatus(
-        `${eco}/${pkgName}@${pkgVer} -> ${list.length} Medium+ match(es) in ${Number(data.elapsed_ms ?? 0).toFixed(2)} ms`,
-      );
+      const ms = Number(data.elapsed_ms ?? 0).toFixed(2);
+      if (list.length > 0) {
+        setPkgStatus(`${eco}/${pkgName}@${pkgVer} -> ${list.length} Medium+ match(es) in ${ms} ms`);
+      } else if (data.installed_unparseable) {
+        setPkgStatus(`${eco}/${pkgName}@${pkgVer} -> Unverifiable (version could not be parsed) in ${ms} ms`);
+      } else if (Number(data.unverifiable_ranges ?? 0) > 0) {
+        setPkgStatus(
+          `${eco}/${pkgName}@${pkgVer} -> No confirmed match (${data.unverifiable_ranges} unverifiable range(s)) in ${ms} ms`,
+        );
+      } else {
+        setPkgStatus(`${eco}/${pkgName}@${pkgVer} -> 0 Medium+ matches in ${ms} ms`);
+      }
     } catch (err) {
       setPkgStatus(`Package check failed: ${(err as Error).message}`);
     }
@@ -102,7 +111,7 @@ export function SemverTab({ nexusUrl, totalPackages }: SemverTabProps) {
                 <div className="mt-1">{v.title}</div>
               </div>
               <Badge variant="outline" className="font-mono text-[11px]">
-                fix: {v.fixed_ver || "none"}
+                {v.fixed_ver ? `fix: ${v.fixed_ver}` : v.last_affected ? `<= ${v.last_affected} (no fix)` : "no fix"}
               </Badge>
             </div>
           ))}

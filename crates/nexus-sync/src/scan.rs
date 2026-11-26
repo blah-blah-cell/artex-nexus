@@ -1,17 +1,26 @@
 use crate::SeverityThreshold;
 use anyhow::Result;
-use nexus_common::version::{ParsedVersion, is_version_affected};
-use nexus_common::{detect_schema_version, open_readonly};
+use nexus_common::queries::{PackageCheckReport, query_package_vulns_detailed};
+use nexus_common::version::ParsedVersion;
+use nexus_common::{detect_schema_version, normalize_pypi_name, open_readonly};
 use regex::Regex;
-use rusqlite::params;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
 
-fn collect_v1_npm_deps(map: &serde_json::Map<String, Value>, out: &mut Vec<(String, String, String)>) {
+#[derive(Debug, Default)]
+pub struct ParsedManifest {
+    pub deps: Vec<(String, String, String)>,
+    pub skipped_unpinned: usize,
+}
+
+fn collect_v1_npm_deps(
+    map: &serde_json::Map<String, Value>,
+    out: &mut Vec<(String, String, String)>,
+) {
     for (name, val) in map {
         if let Some(ver) = val.get("version").and_then(Value::as_str) {
             out.push(("npm".to_string(), name.clone(), ver.to_string()));
@@ -22,13 +31,52 @@ fn collect_v1_npm_deps(map: &serde_json::Map<String, Value>, out: &mut Vec<(Stri
     }
 }
 
-pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)> {
+fn parse_pom_properties(raw: &str) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    let props_block_re = Regex::new(r"(?s)<properties>(.*?)</properties>").unwrap();
+    let tag_re = Regex::new(r"<([A-Za-z0-9._-]+)>\s*([^<]+?)\s*</([A-Za-z0-9._-]+)>").unwrap();
+    if let Some(cap) = props_block_re.captures(raw) {
+        for m in tag_re.captures_iter(&cap[1]) {
+            if m[1] == m[3] {
+                props.insert(m[1].to_string(), m[2].trim().to_string());
+            }
+        }
+    }
+    // Extract top-level <project><version> if present (ignoring nested dependency versions).
+    let no_deps = Regex::new(r"(?s)<dependencies>.*?</dependencies>")
+        .unwrap()
+        .replace_all(raw, "");
+    let ver_re = Regex::new(r"<version>\s*([^<\s]+)\s*</version>").unwrap();
+    if let Some(cap) = ver_re.captures(&no_deps) {
+        props.insert("project.version".to_string(), cap[1].trim().to_string());
+    }
+    props
+}
+
+fn resolve_pom_prop(val: &str, props: &HashMap<String, String>) -> Option<String> {
+    let mut cur = val.trim().to_string();
+    for _ in 0..4 {
+        if let Some(inner) = cur.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+            cur = props.get(inner)?.clone();
+        } else {
+            break;
+        }
+    }
+    if cur.contains("${") || cur.is_empty() {
+        None
+    } else {
+        Some(cur)
+    }
+}
+
+pub fn parse_manifest_file(path: &Path) -> ParsedManifest {
     let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
+        return ParsedManifest::default();
     };
     let raw = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
-    let mut deps = Vec::new();
+    let mut out = ParsedManifest::default();
+
     match fname {
         "package-lock.json" => {
             if let Ok(v) = serde_json::from_str::<Value>(raw) {
@@ -43,11 +91,15 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                                 .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or(tail);
-                            deps.push(("npm".to_string(), pkg_name.to_string(), ver.to_string()));
+                            out.deps.push((
+                                "npm".to_string(),
+                                pkg_name.to_string(),
+                                ver.to_string(),
+                            ));
                         }
                     }
                 } else if let Some(dmap) = v.get("dependencies").and_then(Value::as_object) {
-                    collect_v1_npm_deps(dmap, &mut deps);
+                    collect_v1_npm_deps(dmap, &mut out.deps);
                 }
             }
         }
@@ -56,11 +108,16 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                 for key in ["dependencies", "devDependencies"] {
                     if let Some(map) = v.get(key).and_then(Value::as_object) {
                         for (name, ver) in map {
-                            if let Some(vs) = ver.as_str()
-                                && ParsedVersion::parse(vs).is_some()
-                            {
-                                // Only scan exact pinned versions; ranges (^, ~, >=) need a lockfile.
-                                deps.push(("npm".to_string(), name.clone(), vs.trim().to_string()));
+                            if let Some(vs) = ver.as_str() {
+                                if ParsedVersion::parse(vs).is_some() {
+                                    out.deps.push((
+                                        "npm".to_string(),
+                                        name.clone(),
+                                        vs.trim().to_string(),
+                                    ));
+                                } else {
+                                    out.skipped_unpinned += 1;
+                                }
                             }
                         }
                     }
@@ -75,7 +132,7 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                     continue;
                 }
                 if let Some((pkg_part, ver_part)) = no_marker.split_once("==") {
-                    let pkg = pkg_part.split('[').next().unwrap_or(pkg_part).trim();
+                    let pkg = normalize_pypi_name(pkg_part.split('[').next().unwrap_or(pkg_part));
                     let ver = ver_part
                         .split_whitespace()
                         .next()
@@ -83,8 +140,10 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                         .trim_end_matches('\\')
                         .trim();
                     if !pkg.is_empty() && !ver.is_empty() {
-                        deps.push(("PyPI".to_string(), pkg.to_string(), ver.to_string()));
+                        out.deps.push(("PyPI".to_string(), pkg, ver.to_string()));
                     }
+                } else {
+                    out.skipped_unpinned += 1;
                 }
             }
         }
@@ -105,7 +164,9 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                     in_require_block = true;
                     continue;
                 }
-                if (l.starts_with("exclude") || l.starts_with("replace") || l.starts_with("retract"))
+                if (l.starts_with("exclude")
+                    || l.starts_with("replace")
+                    || l.starts_with("retract"))
                     && l.ends_with('(')
                 {
                     in_ignored_block = true;
@@ -122,7 +183,7 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                     continue;
                 }
                 if parts.len() >= 2 && parts[1].starts_with('v') {
-                    deps.push((
+                    out.deps.push((
                         "Go".to_string(),
                         parts[0].to_string(),
                         parts[1].trim_start_matches('v').to_string(),
@@ -141,7 +202,7 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                 } else if let Some(rest) = l.strip_prefix("version = \"")
                     && !cur_name.is_empty()
                 {
-                    deps.push((
+                    out.deps.push((
                         "crates.io".to_string(),
                         std::mem::take(&mut cur_name),
                         rest.trim_end_matches('"').to_string(),
@@ -156,11 +217,11 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                 if l.starts_with('[') {
                     cur_name.clear();
                 } else if let Some(rest) = l.strip_prefix("name = \"") {
-                    cur_name = rest.trim_end_matches('"').to_string();
+                    cur_name = normalize_pypi_name(rest.trim_end_matches('"'));
                 } else if let Some(rest) = l.strip_prefix("version = \"")
                     && !cur_name.is_empty()
                 {
-                    deps.push((
+                    out.deps.push((
                         "PyPI".to_string(),
                         std::mem::take(&mut cur_name),
                         rest.trim_end_matches('"').to_string(),
@@ -202,7 +263,8 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                         && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
                     {
                         for name in &cur_names {
-                            deps.push(("npm".to_string(), name.clone(), ver.to_string()));
+                            out.deps
+                                .push(("npm".to_string(), name.clone(), ver.to_string()));
                         }
                         cur_names.clear();
                     }
@@ -231,7 +293,8 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                         && ver.chars().next().is_some_and(|c| c.is_ascii_digit())
                         && !ver.contains('/')
                     {
-                        deps.push(("npm".to_string(), name.to_string(), ver.to_string()));
+                        out.deps
+                            .push(("npm".to_string(), name.to_string(), ver.to_string()));
                     }
                 }
             }
@@ -245,7 +308,7 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
                                 pkg.get("name").and_then(Value::as_str),
                                 pkg.get("version").and_then(Value::as_str),
                             ) {
-                                deps.push((
+                                out.deps.push((
                                     "Packagist".to_string(),
                                     name.to_string(),
                                     ver.trim_start_matches(['v', 'V']).to_string(),
@@ -257,32 +320,42 @@ pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)
             }
         }
         "pom.xml" => {
+            let props = parse_pom_properties(raw);
             let dep_re = Regex::new(r"(?s)<dependency>(.*?)</dependency>").unwrap();
             let gid_re = Regex::new(r"<groupId>\s*([^<\s]+)\s*</groupId>").unwrap();
             let aid_re = Regex::new(r"<artifactId>\s*([^<\s]+)\s*</artifactId>").unwrap();
             let ver_re = Regex::new(r"<version>\s*([^<\s]+)\s*</version>").unwrap();
             for cap in dep_re.captures_iter(raw) {
                 let block = &cap[1];
-                if let (Some(g), Some(a), Some(v)) =
-                    (gid_re.captures(block), aid_re.captures(block), ver_re.captures(block))
-                {
-                    let ver = v[1].trim();
-                    if !ver.starts_with('$') && !ver.is_empty() {
-                        deps.push((
+                if let (Some(g), Some(a), Some(v)) = (
+                    gid_re.captures(block),
+                    aid_re.captures(block),
+                    ver_re.captures(block),
+                ) {
+                    if let Some(resolved) = resolve_pom_prop(&v[1], &props) {
+                        out.deps.push((
                             "Maven".to_string(),
                             format!("{}:{}", g[1].trim(), a[1].trim()),
-                            ver.to_string(),
+                            resolved,
                         ));
+                    } else {
+                        out.skipped_unpinned += 1;
                     }
                 }
             }
         }
         _ => {}
     }
-    deps
+    out
+}
+
+#[cfg(test)]
+pub fn parse_dependencies_from_file(path: &Path) -> Vec<(String, String, String)> {
+    parse_manifest_file(path).deps
 }
 
 pub fn build_sarif_report(findings: &[Value]) -> Value {
+    let mut rules_map: BTreeMap<String, Value> = BTreeMap::new();
     let results: Vec<Value> = findings
         .iter()
         .map(|f| {
@@ -296,15 +369,31 @@ pub fn build_sarif_report(findings: &[Value]) -> Value {
             let pkg = f["package"].as_str().unwrap_or("");
             let inst = f["installed"].as_str().unwrap_or("");
             let eco = f["ecosystem"].as_str().unwrap_or("");
-            let fixed = f["fixed"].as_str().unwrap_or("none");
+            let fixed = f["fixed"].as_str().unwrap_or("");
+            let last_aff = f["last_affected"].as_str().unwrap_or("");
+            let range_note = if !fixed.is_empty() {
+                format!("fix: {fixed}")
+            } else if !last_aff.is_empty() {
+                format!("no fix (last affected: {last_aff})")
+            } else {
+                "no fix recorded".to_string()
+            };
             let cve_id = f["cve_id"].as_str().unwrap_or("CVE-UNKNOWN");
             let title = f["title"].as_str().unwrap_or("");
             let manifest = f["file"].as_str().unwrap_or("lockfile");
+
+            rules_map.entry(cve_id.to_string()).or_insert_with(|| {
+                json!({
+                    "id": cve_id,
+                    "shortDescription": { "text": if title.is_empty() { cve_id } else { title } }
+                })
+            });
+
             json!({
                 "ruleId": cve_id,
                 "level": level,
                 "message": {
-                    "text": format!("{pkg}@{inst} ({eco}) affected by {cve_id} (fix: {fixed}) - {title}")
+                    "text": format!("{pkg}@{inst} ({eco}) affected by {cve_id} ({range_note}) - {title}")
                 },
                 "locations": [{
                     "physicalLocation": {
@@ -317,6 +406,7 @@ pub fn build_sarif_report(findings: &[Value]) -> Value {
                     "package": pkg,
                     "installed": inst,
                     "fixed": fixed,
+                    "last_affected": last_aff,
                     "cvss_score": f["cvss_score"],
                     "severity": sev,
                     "is_kev": is_kev,
@@ -326,6 +416,7 @@ pub fn build_sarif_report(findings: &[Value]) -> Value {
         })
         .collect();
 
+    let rules: Vec<Value> = rules_map.into_values().collect();
     json!({
         "version": "2.1.0",
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -334,7 +425,8 @@ pub fn build_sarif_report(findings: &[Value]) -> Value {
                 "driver": {
                     "name": "artex-nexus-sbom-scanner",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/blah-blah-cell/artex-nexus"
+                    "informationUri": "https://github.com/blah-blah-cell/artex-nexus",
+                    "rules": rules
                 }
             },
             "results": results
@@ -347,8 +439,24 @@ fn severity_rank(sev: &str, is_kev: bool) -> u8 {
         "CRITICAL" => 3,
         "HIGH" | "KEV_UNSCORED" => 2,
         "MEDIUM" => 1,
-        _ => if is_kev { 2 } else { 0 },
+        _ => {
+            if is_kev {
+                2
+            } else {
+                0
+            }
+        }
     }
+}
+
+fn rel_manifest_uri(scan_root: &Path, file: &Path) -> String {
+    let base = if scan_root.is_file() {
+        scan_root.parent().unwrap_or(Path::new("."))
+    } else {
+        scan_root
+    };
+    let rel = file.strip_prefix(base).unwrap_or(file);
+    rel.display().to_string().replace('\\', "/")
 }
 
 pub fn cmd_scan(
@@ -357,18 +465,20 @@ pub fn cmd_scan(
     as_json: bool,
     sarif_out: Option<&Path>,
     fail_on: Option<SeverityThreshold>,
+    max_depth: usize,
 ) -> Result<()> {
     let start = Instant::now();
     let conn = open_readonly(db_path)?;
-    if detect_schema_version(&conn) < 2 {
+    if detect_schema_version(&conn)? < 2 {
         anyhow::bail!("Scan requires v2 DB with OSV packages. Run `nexus-sync fetch` first.");
     }
 
+    let depth_limit = max_depth.max(1);
     let targets: Vec<PathBuf> = if path.is_file() {
         vec![path.to_path_buf()]
     } else {
         WalkDir::new(path)
-            .max_depth(4)
+            .max_depth(depth_limit)
             .into_iter()
             .filter_entry(|e| {
                 !matches!(
@@ -399,54 +509,50 @@ pub fn cmd_scan(
             .collect()
     };
 
-    let mut seen = HashSet::new();
+    let mut cache: HashMap<(String, String, String), PackageCheckReport> = HashMap::new();
     let mut findings = Vec::new();
     let mut deps_checked = 0usize;
-
-    let mut stmt = conn.prepare(
-        "SELECT p.cve_id, p.introduced_ver, p.fixed_ver, p.advisory_id,
-                c.cvss_score, c.cvss_severity, c.is_kev, c.epss_score, c.title
-         FROM cve_packages p
-         JOIN cves c ON c.cve_id = p.cve_id
-         WHERE p.package_name = ?1 COLLATE NOCASE AND p.ecosystem = ?2 COLLATE NOCASE",
-    )?;
+    let mut skipped_unpinned = 0usize;
+    let mut unparseable_deps = 0usize;
+    let mut unverifiable_ranges = 0usize;
 
     for file in &targets {
-        for (eco, name, ver) in parse_dependencies_from_file(file) {
-            if !seen.insert((eco.clone(), name.clone(), ver.clone())) {
+        let rel_file = rel_manifest_uri(path, file);
+        let parsed = parse_manifest_file(file);
+        skipped_unpinned += parsed.skipped_unpinned;
+        let mut seen_in_file = HashSet::new();
+
+        for (eco, name, ver) in parsed.deps {
+            if !seen_in_file.insert((eco.clone(), name.clone(), ver.clone())) {
                 continue;
             }
             deps_checked += 1;
-            let rows = stmt.query_map(params![&name, &eco], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, Option<f64>>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)? == 1,
-                    r.get::<_, Option<f64>>(7)?,
-                    r.get::<_, String>(8)?,
-                ))
-            })?;
-            for (cve_id, intro, fixed, adv, score, sev, is_kev, epss, title) in rows.flatten() {
-                if is_version_affected(&ver, &intro, &fixed) == Some(true) {
-                    findings.push(json!({
-                        "file": file.display().to_string(),
-                        "ecosystem": eco,
-                        "package": name,
-                        "installed": ver,
-                        "fixed": fixed,
-                        "cve_id": cve_id,
-                        "advisory_id": adv,
-                        "cvss_score": score,
-                        "severity": sev,
-                        "is_kev": is_kev,
-                        "epss_score": epss,
-                        "title": title
-                    }));
-                }
+            let key = (eco.clone(), name.clone(), ver.clone());
+            if !cache.contains_key(&key) {
+                let rep = query_package_vulns_detailed(&conn, &eco, &name, &ver)?;
+                cache.insert(key.clone(), rep);
+            }
+            let rep = &cache[&key];
+            if rep.installed_unparseable {
+                unparseable_deps += 1;
+            }
+            unverifiable_ranges += rep.unverifiable_ranges;
+            for v in &rep.vulnerabilities {
+                findings.push(json!({
+                    "file": rel_file,
+                    "ecosystem": eco,
+                    "package": name,
+                    "installed": ver,
+                    "fixed": v["fixed_ver"],
+                    "last_affected": v["last_affected"],
+                    "cve_id": v["cve_id"],
+                    "advisory_id": v["advisory_id"],
+                    "cvss_score": v["cvss_score"],
+                    "severity": v["cvss_severity"],
+                    "is_kev": v["is_kev"],
+                    "epss_score": v["epss_score"],
+                    "title": v["title"]
+                }));
             }
         }
     }
@@ -464,7 +570,11 @@ pub fn cmd_scan(
 
     let report = json!({
         "manifests_scanned": targets.len(),
+        "max_depth": depth_limit,
         "dependencies_checked": deps_checked,
+        "skipped_unpinned_or_unresolved": skipped_unpinned,
+        "unparseable_dependencies": unparseable_deps,
+        "unverifiable_ranges": unverifiable_ranges,
         "vulnerabilities_found": findings.len(),
         "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0,
         "findings": findings
@@ -474,22 +584,36 @@ pub fn cmd_scan(
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Offline SBOM scan: {} manifests, {} deps checked, {} Medium+ vulnerabilities ({:.2} ms)",
+            "Offline SBOM scan: {} manifests (max_depth={}), {} deps checked, {} Medium+ vulns, {} skipped unpinned/unresolved, {} unparseable deps, {} unverifiable ranges ({:.2} ms)",
             targets.len(),
+            depth_limit,
             deps_checked,
             findings.len(),
+            skipped_unpinned,
+            unparseable_deps,
+            unverifiable_ranges,
             start.elapsed().as_secs_f64() * 1000.0
         );
         for f in &findings {
+            let fixed = f["fixed"].as_str().unwrap_or("");
+            let last_aff = f["last_affected"].as_str().unwrap_or("");
+            let fix_label = if !fixed.is_empty() {
+                format!("fix: {fixed}")
+            } else if !last_aff.is_empty() {
+                format!("no fix (<= {last_aff})")
+            } else {
+                "no fix".to_string()
+            };
             println!(
-                "  [{} | CVSS {} | KEV={}] {}@{} ({}) -> fix: {} | {} ({})",
+                "  [{} | CVSS {} | KEV={}] {} {}@{} ({}) -> {} | {} ({})",
                 f["severity"].as_str().unwrap_or("?"),
                 f["cvss_score"],
                 f["is_kev"],
+                f["file"].as_str().unwrap_or(""),
                 f["package"].as_str().unwrap_or(""),
                 f["installed"].as_str().unwrap_or(""),
                 f["ecosystem"].as_str().unwrap_or(""),
-                f["fixed"].as_str().unwrap_or("none"),
+                fix_label,
                 f["cve_id"].as_str().unwrap_or(""),
                 f["advisory_id"].as_str().unwrap_or("")
             );

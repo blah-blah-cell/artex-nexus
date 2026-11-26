@@ -31,6 +31,7 @@ export interface CveDetail {
     package_name: string;
     introduced_ver: string;
     fixed_ver: string;
+    last_affected?: string;
     advisory_id: string;
   }[];
   writeups?: {
@@ -45,6 +46,7 @@ export interface PkgVuln {
   cve_id: string;
   advisory_id: string;
   fixed_ver: string;
+  last_affected?: string;
   cvss_score?: number;
   cvss_severity: string;
   is_kev: boolean;

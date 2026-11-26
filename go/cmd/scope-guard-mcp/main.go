@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,8 +13,8 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,23 +50,40 @@ type LedgerEntry struct {
 	SHA256                string `json:"sha256"`
 }
 
+type ledgerTailCache struct {
+	valid    bool
+	fileSize int64
+	modTime  time.Time
+	seq      int
+	headHash string
+}
+
 type GuardState struct {
 	mu        sync.RWMutex
 	configDir string
 	stateDir  string
+	hmacKey   []byte
 	scopes    map[string]ScopePolicy
+	tail      ledgerTailCache
 }
 
 func NewGuardState(configDir, stateDir string) (*GuardState, error) {
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		return nil, err
 	}
+	var hmacKey []byte
+	if k := os.Getenv("SCOPE_LEDGER_HMAC_KEY"); k != "" {
+		hmacKey = []byte(k)
+	}
 	gs := &GuardState{
 		configDir: configDir,
 		stateDir:  stateDir,
+		hmacKey:   hmacKey,
 		scopes:    make(map[string]ScopePolicy),
 	}
-	_ = gs.loadPersistedScopes()
+	if err := gs.loadPersistedScopes(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("loading persisted scopes.json: %w", err)
+	}
 	return gs, nil
 }
 
@@ -77,12 +95,23 @@ func (g *GuardState) ledgerFile() string {
 	return filepath.Join(g.stateDir, "receipts.jsonl")
 }
 
+func (g *GuardState) lockFile() string {
+	return filepath.Join(g.stateDir, "receipts.jsonl.lock")
+}
+
 func (g *GuardState) loadPersistedScopes() error {
 	raw, err := os.ReadFile(g.scopesFile())
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(raw, &g.scopes)
+	var parsed map[string]ScopePolicy
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return fmt.Errorf("corrupt scopes.json (refusing to overwrite): %w", err)
+	}
+	if parsed != nil {
+		g.scopes = parsed
+	}
+	return nil
 }
 
 func (g *GuardState) persistScopesLocked() error {
@@ -91,7 +120,22 @@ func (g *GuardState) persistScopesLocked() error {
 		return err
 	}
 	tmp := g.scopesFile() + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, g.scopesFile())
@@ -99,6 +143,31 @@ func (g *GuardState) persistScopesLocked() error {
 
 func (g *GuardState) resolveConfinedPolicyPath(name string) (string, error) {
 	return pathguard.ResolveConfined(g.configDir, name, false)
+}
+
+// acquireFileLock provides portable cross-process mutual exclusion via atomic O_CREATE|O_EXCL.
+func (g *GuardState) acquireFileLock() (func(), error) {
+	lockPath := g.lockFile()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
+			_ = f.Close()
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if st, statErr := os.Stat(lockPath); statErr == nil && time.Since(st.ModTime()) > 30*time.Second {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("timed out waiting for ledger lock")
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
 }
 
 func isValidHostname(h string) bool {
@@ -119,59 +188,203 @@ func isValidHostname(h string) bool {
 	return true
 }
 
-func extractHost(target string) string {
-	raw := strings.TrimSpace(target)
-	if raw == "" {
-		return ""
+// parseNonStandardIPv4 normalizes decimal (2130706433), hex (0x7f000001), octal (0177.0.0.1),
+// and shorthand (127.1) IPv4 representations into canonical net.IP.
+func parseNonStandardIPv4(h string) net.IP {
+	if h == "" {
+		return nil
 	}
-	if ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(raw, "["), "]")); ip != nil {
-		return ip.String()
+	parts := strings.Split(h, ".")
+	if len(parts) > 4 {
+		return nil
 	}
-	if _, _, err := net.ParseCIDR(raw); err == nil {
-		return strings.ToLower(raw)
+	vals := make([]uint64, len(parts))
+	for i, p := range parts {
+		if p == "" {
+			return nil
+		}
+		v, err := strconv.ParseUint(p, 0, 32)
+		if err != nil {
+			return nil
+		}
+		vals[i] = v
 	}
-	toParse := raw
+	var ip uint32
+	switch len(vals) {
+	case 1:
+		ip = uint32(vals[0])
+	case 2:
+		if vals[0] > 0xff || vals[1] > 0xffffff {
+			return nil
+		}
+		ip = uint32(vals[0]<<24 | vals[1])
+	case 3:
+		if vals[0] > 0xff || vals[1] > 0xff || vals[2] > 0xffff {
+			return nil
+		}
+		ip = uint32(vals[0]<<24 | vals[1]<<16 | vals[2])
+	case 4:
+		if vals[0] > 0xff || vals[1] > 0xff || vals[2] > 0xff || vals[3] > 0xff {
+			return nil
+		}
+		ip = uint32(vals[0]<<24 | vals[1]<<16 | vals[2]<<8 | vals[3])
+	}
+	return net.IPv4(byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
+}
+
+type parsedTarget struct {
+	host string
+	port string
+	path string
+}
+
+func parseTarget(raw string) (parsedTarget, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return parsedTarget{}, false
+	}
+	if ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")); ip != nil {
+		return parsedTarget{host: ip.String()}, true
+	}
+	if _, _, err := net.ParseCIDR(s); err == nil {
+		return parsedTarget{host: strings.ToLower(s)}, true
+	}
+	toParse := s
 	if !strings.Contains(toParse, "://") {
 		toParse = "http://" + toParse
 	}
 	u, err := url.Parse(toParse)
 	if err != nil || u.User != nil {
-		return ""
+		return parsedTarget{}, false
 	}
 	h := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
 	if ip := net.ParseIP(h); ip != nil {
-		return ip.String()
+		return parsedTarget{host: ip.String(), port: u.Port(), path: u.Path}, true
+	}
+	if ip := parseNonStandardIPv4(h); ip != nil {
+		return parsedTarget{host: ip.String(), port: u.Port(), path: u.Path}, true
 	}
 	if !isValidHostname(h) {
-		return ""
+		return parsedTarget{}, false
 	}
-	return h
+	return parsedTarget{host: h, port: u.Port(), path: u.Path}, true
 }
 
-func ruleMatches(host, rule string) bool {
-	r := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rule), "."))
+func validateRule(rawRule string) error {
+	r := strings.ToLower(strings.TrimSpace(rawRule))
+	if r == "" {
+		return errors.New("empty scope rule")
+	}
+	// Strip scheme if present
+	if idx := strings.Index(r, "://"); idx >= 0 {
+		r = r[idx+3:]
+	}
+	// Split optional path prefix
+	hostPort := r
+	if slash := strings.IndexByte(r, '/'); slash >= 0 {
+		if _, _, err := net.ParseCIDR(r); err == nil {
+			return nil
+		}
+		hostPort = r[:slash]
+	}
+	host := hostPort
+	if h, _, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(host, "]"), "["), ".")
+	if net.ParseIP(host) != nil {
+		return nil
+	}
+	if strings.HasPrefix(host, "*.") {
+		base := host[2:]
+		if strings.Contains(base, "*") || strings.Count(base, ".") < 1 || !isValidHostname(base) {
+			return fmt.Errorf("overly broad or invalid wildcard rule %q (must be *.<domain.tld>)", rawRule)
+		}
+		return nil
+	}
+	if strings.ContainsAny(host, "*?[]") {
+		return fmt.Errorf("disallowed glob pattern in scope rule %q (use exact host, CIDR, or *.domain.tld)", rawRule)
+	}
+	if !isValidHostname(host) {
+		return fmt.Errorf("invalid hostname in scope rule %q", rawRule)
+	}
+	return nil
+}
+
+func ruleMatches(t parsedTarget, rule string) bool {
+	r := strings.ToLower(strings.TrimSpace(rule))
 	if r == "" {
 		return false
 	}
-	if ip := net.ParseIP(host); ip != nil {
+	if ip := net.ParseIP(t.host); ip != nil {
 		if _, cidr, err := net.ParseCIDR(r); err == nil {
 			return cidr.Contains(ip)
 		}
-		if rip := net.ParseIP(r); rip != nil {
-			return ip.Equal(rip)
+	}
+	// Parse optional scheme, host, port, and path prefix on the rule.
+	if idx := strings.Index(r, "://"); idx >= 0 {
+		r = r[idx+3:]
+	}
+	rulePath := ""
+	hostPort := r
+	if slash := strings.IndexByte(r, '/'); slash >= 0 {
+		hostPort = r[:slash]
+		rulePath = strings.TrimSuffix(r[slash:], "*")
+	}
+	ruleHost := hostPort
+	rulePort := ""
+	if h, p, err := net.SplitHostPort(hostPort); err == nil {
+		ruleHost = h
+		rulePort = p
+	}
+	ruleHost = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(ruleHost, "]"), "["), ".")
+
+	if rulePort != "" && t.port != rulePort {
+		return false
+	}
+	if rulePath != "" {
+		tp := strings.ToLower(t.path)
+		if tp == "" {
+			tp = "/"
+		}
+		if !strings.HasPrefix(tp, rulePath) {
+			return false
 		}
 	}
-	if strings.HasPrefix(r, "*.") {
-		base := r[2:]
-		return host == base || strings.HasSuffix(host, "."+base)
+
+	if ip := net.ParseIP(t.host); ip != nil {
+		if rip := net.ParseIP(ruleHost); rip != nil {
+			return ip.Equal(rip)
+		}
+		if rip := parseNonStandardIPv4(ruleHost); rip != nil {
+			return ip.Equal(rip)
+		}
+		return false
 	}
-	ok, _ := path.Match(r, host)
-	return ok
+	if strings.HasPrefix(ruleHost, "*.") {
+		base := ruleHost[2:]
+		if strings.Contains(base, "*") || strings.Count(base, ".") < 1 {
+			return false
+		}
+		// *.example.com matches subdomains ONLY, not the apex example.com.
+		return strings.HasSuffix(t.host, "."+base)
+	}
+	if strings.ContainsAny(ruleHost, "*?[]") {
+		return false
+	}
+	return t.host == ruleHost
 }
 
-func computeEntryHash(e LedgerEntry) string {
+func computeEntryHash(e LedgerEntry, hmacKey []byte) string {
 	e.SHA256 = ""
 	canonical, _ := json.Marshal(e)
+	if len(hmacKey) > 0 {
+		mac := hmac.New(sha256.New, hmacKey)
+		mac.Write([]byte(e.PrevSHA256))
+		mac.Write([]byte("|"))
+		mac.Write(canonical)
+		return hex.EncodeToString(mac.Sum(nil))
+	}
 	h := sha256.New()
 	h.Write([]byte(e.PrevSHA256))
 	h.Write([]byte("|"))
@@ -205,22 +418,58 @@ func (g *GuardState) readLedgerLocked() ([]LedgerEntry, error) {
 	return entries, sc.Err()
 }
 
-func verifyEntries(entries []LedgerEntry) map[string]any {
+func (g *GuardState) currentTailLocked() (int, string, error) {
+	st, err := os.Stat(g.ledgerFile())
+	if errors.Is(err, os.ErrNotExist) {
+		g.tail = ledgerTailCache{valid: true, seq: 0, headHash: "GENESIS"}
+		return 0, "GENESIS", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if g.tail.valid && g.tail.fileSize == st.Size() && g.tail.modTime.Equal(st.ModTime()) {
+		return g.tail.seq, g.tail.headHash, nil
+	}
+	entries, err := g.readLedgerLocked()
+	if err != nil {
+		return 0, "", err
+	}
+	seq := len(entries)
+	head := "GENESIS"
+	if seq > 0 {
+		head = entries[seq-1].SHA256
+	}
+	g.tail = ledgerTailCache{
+		valid:    true,
+		fileSize: st.Size(),
+		modTime:  st.ModTime(),
+		seq:      seq,
+		headHash: head,
+	}
+	return seq, head, nil
+}
+
+func verifyEntries(entries []LedgerEntry, hmacKey []byte) map[string]any {
+	keyed := len(hmacKey) > 0
 	expectedPrev := "GENESIS"
 	for i, e := range entries {
 		if e.Seq != i+1 {
-			return map[string]any{"valid": false, "entries": len(entries), "tampered_seq": i + 1, "reason": "sequence discontinuity"}
+			return map[string]any{"valid": false, "keyed_hmac": keyed, "entries": len(entries), "tampered_seq": i + 1, "reason": "sequence discontinuity"}
 		}
 		if e.PrevSHA256 != expectedPrev {
-			return map[string]any{"valid": false, "entries": len(entries), "tampered_seq": e.Seq, "reason": "prev_sha256 link mismatch"}
+			return map[string]any{"valid": false, "keyed_hmac": keyed, "entries": len(entries), "tampered_seq": e.Seq, "reason": "prev_sha256 link mismatch"}
 		}
-		recomputed := computeEntryHash(e)
+		recomputed := computeEntryHash(e, hmacKey)
 		if e.SHA256 != recomputed {
-			return map[string]any{"valid": false, "entries": len(entries), "tampered_seq": e.Seq, "reason": "entry sha256 mismatch"}
+			return map[string]any{"valid": false, "keyed_hmac": keyed, "entries": len(entries), "tampered_seq": e.Seq, "reason": "entry sha256 mismatch"}
 		}
 		expectedPrev = e.SHA256
 	}
-	return map[string]any{"valid": true, "entries": len(entries), "head_sha256": expectedPrev}
+	out := map[string]any{"valid": true, "keyed_hmac": keyed, "entries": len(entries), "head_sha256": expectedPrev}
+	if !keyed {
+		out["note"] = "unkeyed SHA-256 chain detects in-place edits; set SCOPE_LEDGER_HMAC_KEY to detect full rewrites"
+	}
+	return out
 }
 
 func (g *GuardState) VerifyLedger() map[string]any {
@@ -230,7 +479,29 @@ func (g *GuardState) VerifyLedger() map[string]any {
 	if err != nil {
 		return map[string]any{"valid": false, "error": err.Error()}
 	}
-	return verifyEntries(entries)
+	return verifyEntries(entries, g.hmacKey)
+}
+
+func (g *GuardState) evaluateTargetLocked(target, sid string) (bool, string, string, string) {
+	pt, ok := parseTarget(target)
+	if !ok {
+		return false, "", "", "empty or unparseable host"
+	}
+	pol, exists := g.scopes[sid]
+	if !exists || len(pol.InScope) == 0 {
+		return false, pt.host, "", "no scope policy loaded for this scope_id"
+	}
+	for _, deny := range pol.OutOfScope {
+		if ruleMatches(pt, deny) {
+			return false, pt.host, deny, "excluded by out_of_scope"
+		}
+	}
+	for _, allow := range pol.InScope {
+		if ruleMatches(pt, allow) {
+			return true, pt.host, allow, "matched in_scope"
+		}
+	}
+	return false, pt.host, "", "did not match any in_scope rule"
 }
 
 func scopeIDFromArgs(args map[string]any) string {
@@ -243,6 +514,23 @@ func scopeIDFromArgs(args map[string]any) string {
 func strArg(args map[string]any, key string) string {
 	v, _ := args[key].(string)
 	return strings.TrimSpace(v)
+}
+
+func escapeMarkdownInline(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		"`", `\'`,
+		"*", `\*`,
+		"_", `\_`,
+		"[", `\[`,
+		"]", `\]`,
+		"<", `&lt;`,
+		">", `&gt;`,
+		"#", `\#`,
+	)
+	return replacer.Replace(s)
 }
 
 func (g *GuardState) LoadPolicyFile(policyFile, sid string) (ScopePolicy, error) {
@@ -265,6 +553,16 @@ func (g *GuardState) LoadPolicyFile(policyFile, sid string) (ScopePolicy, error)
 	} else {
 		if err := yaml.Unmarshal(raw, &pol); err != nil {
 			return ScopePolicy{}, err
+		}
+	}
+	for _, r := range pol.InScope {
+		if err := validateRule(r); err != nil {
+			return ScopePolicy{}, fmt.Errorf("invalid in_scope rule: %w", err)
+		}
+	}
+	for _, r := range pol.OutOfScope {
+		if err := validateRule(r); err != nil {
+			return ScopePolicy{}, fmt.Errorf("invalid out_of_scope rule: %w", err)
 		}
 	}
 	pol.ScopeID = sid
@@ -307,7 +605,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 
 	srv.Register(mcpserver.Tool{
 		Name:        "check_target_in_scope",
-		Description: "Check whether a domain, URL, or IP is allowed under a persisted scope_id (out_of_scope wins over in_scope).",
+		Description: "Check whether a domain, URL, host:port/path, or IP is allowed under a persisted scope_id (out_of_scope wins over in_scope).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -319,27 +617,23 @@ func buildServer(state *GuardState) *mcpserver.Server {
 		Handler: func(_ context.Context, args map[string]any) (any, error) {
 			target := strArg(args, "target")
 			sid := scopeIDFromArgs(args)
-			host := extractHost(target)
-			if host == "" {
-				return map[string]any{"allowed": false, "target": target, "reason": "empty or unparseable host"}, nil
-			}
 			state.mu.RLock()
-			pol, exists := state.scopes[sid]
+			allowed, host, matchedRule, reason := state.evaluateTargetLocked(target, sid)
+			pol := state.scopes[sid]
 			state.mu.RUnlock()
-			if !exists || len(pol.InScope) == 0 {
-				return map[string]any{"allowed": false, "scope_id": sid, "host": host, "reason": "no scope policy loaded for this scope_id"}, nil
+			out := map[string]any{
+				"allowed":  allowed,
+				"scope_id": sid,
+				"host":     host,
+				"reason":   reason,
 			}
-			for _, deny := range pol.OutOfScope {
-				if ruleMatches(host, deny) {
-					return map[string]any{"allowed": false, "scope_id": sid, "host": host, "matched_rule": deny, "reason": "excluded by out_of_scope"}, nil
-				}
+			if matchedRule != "" {
+				out["matched_rule"] = matchedRule
 			}
-			for _, allow := range pol.InScope {
-				if ruleMatches(host, allow) {
-					return map[string]any{"allowed": true, "scope_id": sid, "program": pol.Program, "host": host, "matched_rule": allow, "reason": "matched in_scope"}, nil
-				}
+			if allowed {
+				out["program"] = pol.Program
 			}
-			return map[string]any{"allowed": false, "scope_id": sid, "host": host, "reason": "did not match any in_scope rule"}, nil
+			return out, nil
 		},
 	})
 
@@ -361,7 +655,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 
 	srv.Register(mcpserver.Tool{
 		Name:        "record_evidence_receipt",
-		Description: "Append a SHA-256 hash-chained verification receipt to receipts.jsonl.",
+		Description: "Append a hash-chained verification receipt to receipts.jsonl after verifying target scope.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -375,6 +669,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 				"verification_command":    map[string]any{"type": "string"},
 				"observed_output_summary": map[string]any{"type": "string"},
 				"remediation":             map[string]any{"type": "string"},
+				"allow_out_of_scope":      map[string]any{"type": "boolean", "default": false},
 			},
 			"required": []string{"finding_id", "title", "target", "cwe", "severity", "verification_command", "observed_output_summary"},
 		},
@@ -389,25 +684,36 @@ func buildServer(state *GuardState) *mcpserver.Server {
 			if findingID == "" || title == "" || target == "" || cwe == "" || sev == "" || verifyCmd == "" || obs == "" {
 				return nil, errors.New("finding_id, title, target, cwe, severity, verification_command, and observed_output_summary are required")
 			}
+			allowOOS, _ := args["allow_out_of_scope"].(bool)
 
 			sid := scopeIDFromArgs(args)
 			state.mu.Lock()
 			defer state.mu.Unlock()
 
-			entries, err := state.readLedgerLocked()
+			pol, hasPolicy := state.scopes[sid]
+			if hasPolicy && !allowOOS {
+				allowed, _, _, reason := state.evaluateTargetLocked(target, sid)
+				if !allowed {
+					return nil, fmt.Errorf("target %q failed scope check for %q: %s", target, sid, reason)
+				}
+			}
+
+			unlock, err := state.acquireFileLock()
 			if err != nil {
 				return nil, err
 			}
-			prevHash := "GENESIS"
-			if len(entries) > 0 {
-				prevHash = entries[len(entries)-1].SHA256
+			defer unlock()
+
+			lastSeq, prevHash, err := state.currentTailLocked()
+			if err != nil {
+				return nil, err
 			}
 			prog := "unconfigured"
-			if p, ok := state.scopes[sid]; ok && p.Program != "" {
-				prog = p.Program
+			if hasPolicy && pol.Program != "" {
+				prog = pol.Program
 			}
 			entry := LedgerEntry{
-				Seq:                   len(entries) + 1,
+				Seq:                   lastSeq + 1,
 				ScopeID:               sid,
 				FindingID:             findingID,
 				Program:               prog,
@@ -422,16 +728,34 @@ func buildServer(state *GuardState) *mcpserver.Server {
 				RecordedAt:            time.Now().UTC().Format(time.RFC3339),
 				PrevSHA256:            prevHash,
 			}
-			entry.SHA256 = computeEntryHash(entry)
+			entry.SHA256 = computeEntryHash(entry, state.hmacKey)
 
 			f, err := os.OpenFile(state.ledgerFile(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 			if err != nil {
 				return nil, err
 			}
-			defer f.Close()
 			line, _ := json.Marshal(entry)
 			if _, err := f.Write(append(line, '\n')); err != nil {
+				_ = f.Close()
 				return nil, err
+			}
+			if err := f.Sync(); err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			if err := f.Close(); err != nil {
+				return nil, err
+			}
+			if st, statErr := os.Stat(state.ledgerFile()); statErr == nil {
+				state.tail = ledgerTailCache{
+					valid:    true,
+					fileSize: st.Size(),
+					modTime:  st.ModTime(),
+					seq:      entry.Seq,
+					headHash: entry.SHA256,
+				}
+			} else {
+				state.tail.valid = false
 			}
 			return map[string]any{
 				"recorded":    true,
@@ -444,7 +768,7 @@ func buildServer(state *GuardState) *mcpserver.Server {
 
 	srv.Register(mcpserver.Tool{
 		Name:        "verify_ledger_chain",
-		Description: "Verify the SHA-256 hash chain in receipts.jsonl from GENESIS to the latest entry.",
+		Description: "Verify the hash chain in receipts.jsonl from GENESIS to the latest entry.",
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 		Handler: func(_ context.Context, _ map[string]any) (any, error) {
 			return state.VerifyLedger(), nil
@@ -470,11 +794,12 @@ func buildServer(state *GuardState) *mcpserver.Server {
 
 			state.mu.RLock()
 			all, err := state.readLedgerLocked()
+			hmacKey := state.hmacKey
 			state.mu.RUnlock()
 			if err != nil {
 				return nil, err
 			}
-			chainStatus := verifyEntries(all)
+			chainStatus := verifyEntries(all, hmacKey)
 			var filtered []LedgerEntry
 			for _, e := range all {
 				if filterScope == "" || e.ScopeID == filterScope {
@@ -484,7 +809,16 @@ func buildServer(state *GuardState) *mcpserver.Server {
 
 			if fmtType == "sarif" {
 				results := make([]map[string]any, 0, len(filtered))
+				rulesSeen := make(map[string]bool)
+				rules := make([]map[string]any, 0)
 				for _, e := range filtered {
+					if !rulesSeen[e.CWE] {
+						rulesSeen[e.CWE] = true
+						rules = append(rules, map[string]any{
+							"id":               e.CWE,
+							"shortDescription": map[string]string{"text": "Verified security finding (" + e.CWE + ")"},
+						})
+					}
 					lvl := "warning"
 					if e.Severity == "CRITICAL" || e.Severity == "HIGH" {
 						lvl = "error"
@@ -507,27 +841,50 @@ func buildServer(state *GuardState) *mcpserver.Server {
 					"version": "2.1.0",
 					"$schema": "https://json.schemastore.org/sarif-2.1.0.json",
 					"runs": []map[string]any{{
-						"tool":    map[string]any{"driver": map[string]any{"name": "artex-nexus-scope-guard", "version": "0.5.0"}},
+						"tool": map[string]any{
+							"driver": map[string]any{
+								"name":    "artex-nexus-scope-guard",
+								"version": "0.5.0",
+								"rules":   rules,
+							},
+						},
 						"results": results,
 					}},
 				}
 				b, _ := json.MarshalIndent(sarif, "", "  ")
-				return map[string]any{"format": "sarif", "count": len(filtered), "chain": chainStatus, "content": string(b)}, nil
+				return map[string]any{
+					"format":              "sarif",
+					"count":               len(filtered),
+					"total_ledger_count":  len(all),
+					"filtered_by_scope":   filterScope,
+					"full_ledger_chain":   chainStatus,
+					"chain":               chainStatus,
+					"content":             string(b),
+				}, nil
 			}
 
 			var sb strings.Builder
-			fmt.Fprintf(&sb, "# Security Verification Report (Chain Valid: %v)\n\n", chainStatus["valid"])
+			fmt.Fprintf(&sb, "# Security Verification Report (Full Ledger Chain Valid: %v, Showing %d/%d Entries)\n\n",
+				chainStatus["valid"], len(filtered), len(all))
 			for _, e := range filtered {
-				fmt.Fprintf(&sb, "## #%d [%s] %s\n", e.Seq, e.FindingID, e.Title)
-				fmt.Fprintf(&sb, "- **Scope:** `%s` (%s)\n", e.ScopeID, e.Program)
-				fmt.Fprintf(&sb, "- **Severity:** %s (`%s`)\n", e.Severity, e.CVSSVector)
-				fmt.Fprintf(&sb, "- **CWE:** %s\n", e.CWE)
-				fmt.Fprintf(&sb, "- **Target:** `%s`\n", e.Target)
-				fmt.Fprintf(&sb, "- **Verification:** `%s`\n", e.VerificationCommand)
-				fmt.Fprintf(&sb, "- **Observed Evidence:** %s\n", e.ObservedOutputSummary)
+				fmt.Fprintf(&sb, "## #%d [%s] %s\n", e.Seq, escapeMarkdownInline(e.FindingID), escapeMarkdownInline(e.Title))
+				fmt.Fprintf(&sb, "- **Scope:** `%s` (%s)\n", escapeMarkdownInline(e.ScopeID), escapeMarkdownInline(e.Program))
+				fmt.Fprintf(&sb, "- **Severity:** %s (`%s`)\n", escapeMarkdownInline(e.Severity), escapeMarkdownInline(e.CVSSVector))
+				fmt.Fprintf(&sb, "- **CWE:** %s\n", escapeMarkdownInline(e.CWE))
+				fmt.Fprintf(&sb, "- **Target:** `%s`\n", escapeMarkdownInline(e.Target))
+				fmt.Fprintf(&sb, "- **Verification:** `%s`\n", escapeMarkdownInline(e.VerificationCommand))
+				fmt.Fprintf(&sb, "- **Observed Evidence:** %s\n", escapeMarkdownInline(e.ObservedOutputSummary))
 				fmt.Fprintf(&sb, "- **Chain:** `%s` -> `%s`\n\n", e.PrevSHA256, e.SHA256)
 			}
-			return map[string]any{"format": "markdown", "count": len(filtered), "chain": chainStatus, "content": sb.String()}, nil
+			return map[string]any{
+				"format":             "markdown",
+				"count":              len(filtered),
+				"total_ledger_count": len(all),
+				"filtered_by_scope":  filterScope,
+				"full_ledger_chain":  chainStatus,
+				"chain":              chainStatus,
+				"content":            sb.String(),
+			}, nil
 		},
 	})
 
@@ -549,13 +906,9 @@ func main() {
 		os.Exit(1)
 	}
 	if strings.TrimSpace(*defaultPolicy) != "" {
-		pol, err := state.LoadPolicyFile(*defaultPolicy, "default")
-		if err != nil {
+		if _, err := state.LoadPolicyFile(*defaultPolicy, "default"); err != nil {
 			fmt.Fprintf(os.Stderr, "scope-guard-mcp default-policy error: %v\n", err)
 			os.Exit(1)
-		}
-		if pol.Program != "" && pol.Program != "default" {
-			_, _ = state.LoadPolicyFile(*defaultPolicy, pol.Program)
 		}
 	}
 	srv := buildServer(state)

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -33,6 +34,17 @@ components:
         self:
           $ref: '#/components/schemas/UserUpdate'
 paths:
+  /api/auth/login:
+    post:
+      operationId: login
+  /api/devices/{android}/{valid}:
+    get:
+      operationId: getDevice
+      parameters:
+        - name: host_header_hint
+          in: query
+          schema:
+            type: string
   /api/users/{user_id}:
     put:
       operationId: updateUser
@@ -55,9 +67,10 @@ paths:
 		t.Fatalf("auditOpenAPISpec failed: %v", err)
 	}
 	sum := res["summary"].(map[string]int)
+	// /api/auth/login must NOT be flagged as unauthenticated write; {android}/{valid} must NOT match BOLA; host_header_hint must NOT match SSRF.
 	if sum["unauthenticated_writes"] != 1 || sum["bola_idor_candidates"] != 1 ||
 		sum["ssrf_redirect_params"] != 1 || sum["mass_assignment_risks"] != 1 {
-		t.Fatalf("expected all 4 vulnerability surfaces flagged (including $ref), got %+v", sum)
+		t.Fatalf("expected exactly 1 per category (skipping login, {android}/{valid}, host_header_hint), got %+v", sum)
 	}
 
 	if _, err := auditOpenAPISpec(ws, "../outside.yaml"); err == nil {
@@ -68,14 +81,22 @@ paths:
 	}
 }
 
-func TestScanSourceSinksAndConfinement(t *testing.T) {
+func TestScanSourceSinksRedactionAndNoiseReduction(t *testing.T) {
 	tmp := t.TempDir()
 	ws := filepath.Join(tmp, "ws")
 	if err := os.MkdirAll(ws, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	pyFile := filepath.Join(ws, "handler.py")
-	_ = os.WriteFile(pyFile, []byte("import subprocess, pickle\nsubprocess.run(cmd, shell=True)\npickle.loads(data)\n"), 0o600)
+	pyCode := strings.Join([]string{
+		"import subprocess, pickle, yaml",
+		"subprocess.run(cmd, shell=True)",
+		"pickle.loads(data)",
+		"yaml.load(raw, Loader=yaml.SafeLoader)", // safe: must NOT flag
+		`cursor.execute("SELECT * FROM users WHERE id = %s", (uid,))`, // parameterized: must NOT flag
+		`TOKEN = "ghp_123456789012345678901234567890123456"`,         // must flag AND redact!
+	}, "\n")
+	_ = os.WriteFile(pyFile, []byte(pyCode), 0o600)
 	outside := filepath.Join(tmp, "secret.env")
 	_ = os.WriteFile(outside, []byte("TOKEN=ghp_123456789012345678901234567890123456\n"), 0o600)
 
@@ -83,15 +104,33 @@ func TestScanSourceSinksAndConfinement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scanSourceSinks failed: %v", err)
 	}
-	if res["finding_count"].(int) < 2 {
-		t.Fatalf("expected >=2 sink findings, got %v", res["finding_count"])
+	findings := res["findings"].([]map[string]any)
+	if len(findings) != 3 {
+		t.Fatalf("expected exactly 3 findings (shell, pickle, redacted secret), got %d: %+v", len(findings), findings)
+	}
+	for _, f := range findings {
+		if f["rule_id"] == "HARDCODED_SECRET" {
+			snip := f["snippet"].(string)
+			if strings.Contains(snip, "ghp_123456789012345678901234567890123456") {
+				t.Fatalf("raw secret leaked in snippet: %s", snip)
+			}
+		}
 	}
 	if _, err := scanSourceSinks(ws, outside, 50); err == nil {
 		t.Fatal("expected scan outside workspace root to be blocked")
 	}
 }
 
-func TestInspectJWTAndMultipleCookies(t *testing.T) {
+func TestInspectJWTMalformedHeaderDoesNotClaimAlgNone(t *testing.T) {
+	// Corrupt base64 header must be INFO decode failure, NEVER CRITICAL alg=none.
+	bad := inspectJWTAndHeaders("!!!not-base64!!!.eyJzdWIiOiJhZG1pbiJ9.sig", nil)
+	issues := bad["issues"].([]map[string]any)
+	for _, iss := range issues {
+		if iss["severity"] == "CRITICAL" {
+			t.Fatalf("malformed JWT header must not be reported as CRITICAL alg=none: %+v", iss)
+		}
+	}
+
 	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","kid":"../../etc/passwd","jku":"https://evil.test/jwks.json"}`))
 	pay := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"admin"}`))
 	token := hdr + "." + pay + "."

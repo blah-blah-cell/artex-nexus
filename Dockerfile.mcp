@@ -1,23 +1,24 @@
-# Multi-stage Rust + Go build for ARTEX-Nexus MCP servers
-FROM rust:1.88-slim-bookworm AS rust-builder
+# Multi-stage Rust + Go build for ARTEX-Nexus MCP servers (digest-pinned base images)
+FROM rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS rust-builder
 WORKDIR /src
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --workspace
+RUN cargo build --release --locked --workspace
 
-FROM golang:1.26-bookworm AS go-builder
+FROM golang:1.26-bookworm@sha256:ea47ee45f1284d60f9cc09cb2c3bb4f508c256b640bd8bb30342ff13d1adcb52 AS go-builder
 WORKDIR /src/go
-COPY go/go.mod go/go.sum* ./
+COPY go/go.mod go/go.sum ./
 RUN go mod download
 COPY go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/patch-diff-mcp ./cmd/patch-diff-mcp && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/scope-guard-mcp ./cmd/scope-guard-mcp && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/attack-surface-mcp ./cmd/attack-surface-mcp
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && \
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* && \
     groupadd -g 10001 nexus && useradd -u 10001 -g 10001 -m -s /usr/sbin/nologin nexus && \
-    mkdir -p /app /data /config /workspace && chown -R nexus:nexus /app /data /config /workspace
+    mkdir -p /app /data /config /state /state/receipts /workspace && \
+    chown -R nexus:nexus /app /data /config /state /workspace
 COPY --from=rust-builder /src/target/release/nexus-sync /usr/local/bin/nexus-sync
 COPY --from=rust-builder /src/target/release/cve-intel-mcp /usr/local/bin/cve-intel-mcp
 COPY --from=go-builder /out/patch-diff-mcp /usr/local/bin/patch-diff-mcp
@@ -28,3 +29,5 @@ USER nexus
 ENV MCP_HOST=0.0.0.0
 ENV MCP_TRANSPORT=http
 ENV ATTACK_SURFACE_ROOT=/workspace
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD sh -c 'curl -fsS "http://127.0.0.1:${HEALTH_PORT:-8901}${HEALTH_PATH:-/health}" >/dev/null'

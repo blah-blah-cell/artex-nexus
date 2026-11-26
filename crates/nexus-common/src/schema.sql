@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS writeups (
     has_patch_diff INTEGER NOT NULL DEFAULT 0,
     content_excerpt TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (cve_id) REFERENCES cves(cve_id) ON DELETE CASCADE,
-    UNIQUE (cve_id, url)
+    UNIQUE (cve_id, source, url)
 );
 
 CREATE INDEX IF NOT EXISTS idx_cves_cvss ON cves(cvss_score DESC);

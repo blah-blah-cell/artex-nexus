@@ -1,17 +1,87 @@
 use std::cmp::Ordering;
 
-/// Comparable version supporting SemVer 2.0.0, optional `v` prefixes, and dotted numeric tuples.
+/// Comparable version supporting SemVer 2.0.0, optional `v` prefixes, dotted numeric tuples,
+/// Maven release qualifiers (`.RELEASE`, `.Final`, `.GA`, `.RC1`, `.M1`, `.SNAPSHOT`), and
+/// Python PEP 440 suffixes (`1.0a1`, `1.0b2`, `1.0rc1`, `1.0.dev1`, `1.0.post1`).
 /// Rejects range operators (`^`, `~`, `>`, `<`, `*`, `|`) and git commit hashes.
 #[derive(Debug, Clone, Eq)]
 pub struct ParsedVersion {
     pub nums: Vec<u64>,
     pub prerelease: Option<String>,
+    pub post: Option<u64>,
 }
 
 impl PartialEq for ParsedVersion {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
+}
+
+fn split_numeric_prefix(seg: &str) -> Option<(u64, &str)> {
+    let digit_end = seg
+        .bytes()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(seg.len());
+    if digit_end == 0 {
+        return None;
+    }
+    let num = seg[..digit_end].parse::<u64>().ok()?;
+    Some((num, &seg[digit_end..]))
+}
+
+fn parse_pep440_or_maven_tail(tail: &str) -> Option<(Option<String>, Option<u64>)> {
+    let low = tail.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return Some((None, None));
+    }
+    if matches!(low.as_str(), "release" | "final" | "ga") {
+        return Some((None, None));
+    }
+    if let Some(rest) = low.strip_prefix("post") {
+        let rest = rest.trim_start_matches(['.', '-', '_']);
+        if rest.is_empty() {
+            return Some((None, Some(0)));
+        }
+        if let Ok(n) = rest.parse::<u64>() {
+            return Some((None, Some(n)));
+        }
+        return None;
+    }
+    if let Some(rest) = low.strip_prefix("sp")
+        && let Ok(n) = rest.parse::<u64>()
+    {
+        return Some((None, Some(n)));
+    }
+    // PEP 440 / Maven pre-release qualifiers
+    let normalized = if let Some(rest) = low.strip_prefix("alpha") {
+        format!("alpha.{}", rest.trim_start_matches(['.', '-']))
+    } else if let Some(rest) = low.strip_prefix("beta") {
+        format!("beta.{}", rest.trim_start_matches(['.', '-']))
+    } else if let Some(rest) = low.strip_prefix("rc") {
+        format!("rc.{}", rest.trim_start_matches(['.', '-']))
+    } else if let Some(rest) = low.strip_prefix("dev") {
+        format!("0dev.{}", rest.trim_start_matches(['.', '-']))
+    } else if low == "snapshot" {
+        "0snapshot".to_string()
+    } else if let Some(rest) = low.strip_prefix('a')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        format!("alpha.{rest}")
+    } else if let Some(rest) = low.strip_prefix('b')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        format!("beta.{rest}")
+    } else if let Some(rest) = low.strip_prefix('m')
+        && !rest.is_empty()
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        format!("m.{rest}")
+    } else {
+        return None;
+    };
+    Some((Some(normalized.trim_end_matches('.').to_string()), None))
 }
 
 impl ParsedVersion {
@@ -35,22 +105,78 @@ impl ParsedVersion {
         let no_build = s.split('+').next().unwrap_or(s);
         let mut parts = no_build.splitn(2, '-');
         let core = parts.next().unwrap_or("");
-        let prerelease = parts
+        let mut prerelease = parts
             .next()
-            .map(|p| p.trim().to_lowercase())
+            .map(|p| p.trim().to_ascii_lowercase())
             .filter(|p| !p.is_empty());
+        let mut post: Option<u64> = None;
 
+        // Handle Maven dash qualifiers like 1.2.3-RELEASE / 1.2.3-Final / 1.2.3-GA / 1.2.3-SP1
+        if let Some(ref pre) = prerelease
+            && matches!(pre.as_str(), "release" | "final" | "ga")
+        {
+            prerelease = None;
+        } else if let Some(ref pre) = prerelease
+            && let Some(rest) = pre.strip_prefix("post")
+            && let Ok(n) = rest.trim_start_matches(['.', '-']).parse::<u64>()
+        {
+            prerelease = None;
+            post = Some(n);
+        }
+
+        // Reject bare hex git commit hashes (e.g., 9f8e7d6c5b4a3210) that have no dots and contain hex letters.
+        if !core.contains('.')
+            && core.len() >= 7
+            && core.bytes().all(|b| b.is_ascii_hexdigit())
+            && !core.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let segs: Vec<&str> = core.split('.').collect();
         let mut nums = Vec::new();
-        for seg in core.split('.') {
-            if seg.is_empty() || !seg.chars().all(|c| c.is_ascii_digit()) {
+        for (idx, seg) in segs.iter().enumerate() {
+            if seg.is_empty() {
                 return None;
             }
-            nums.push(seg.parse::<u64>().ok()?);
+            if seg.bytes().all(|b| b.is_ascii_digit()) {
+                nums.push(seg.parse::<u64>().ok()?);
+                continue;
+            }
+            // Only the final segment may carry a PEP 440 or Maven qualifier (e.g., 1.0a1, 1.0.post1, 1.2.3.RELEASE).
+            if idx + 1 != segs.len() {
+                return None;
+            }
+            if let Some((n, rest)) = split_numeric_prefix(seg) {
+                nums.push(n);
+                let (pre_q, post_q) = parse_pep440_or_maven_tail(rest)?;
+                if prerelease.is_none() {
+                    prerelease = pre_q;
+                }
+                if post.is_none() {
+                    post = post_q;
+                }
+            } else {
+                if nums.is_empty() {
+                    return None;
+                }
+                let (pre_q, post_q) = parse_pep440_or_maven_tail(seg)?;
+                if prerelease.is_none() {
+                    prerelease = pre_q;
+                }
+                if post.is_none() {
+                    post = post_q;
+                }
+            }
         }
         if nums.is_empty() {
             return None;
         }
-        Some(Self { nums, prerelease })
+        Some(Self {
+            nums,
+            prerelease,
+            post,
+        })
     }
 }
 
@@ -90,11 +216,17 @@ impl Ord for ParsedVersion {
             }
         }
         match (&self.prerelease, &other.prerelease) {
-            (None, None) => Ordering::Equal,
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(a), Some(b)) => cmp_prerelease(a, b),
+            (None, None) => {}
+            (Some(_), None) => return Ordering::Less,
+            (None, Some(_)) => return Ordering::Greater,
+            (Some(a), Some(b)) => {
+                let ord = cmp_prerelease(a, b);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
         }
+        self.post.cmp(&other.post)
     }
 }
 
@@ -138,17 +270,47 @@ mod tests {
     fn evaluates_semver_and_osv_ranges() {
         assert_eq!(is_version_affected("4.17.15", "0", "4.17.21"), Some(true));
         assert_eq!(is_version_affected("4.17.21", "0", "4.17.21"), Some(false));
-        assert_eq!(is_version_affected("4.18.0", "4.0.0", "4.18.0"), Some(false));
+        assert_eq!(
+            is_version_affected("4.18.0", "4.0.0", "4.18.0"),
+            Some(false)
+        );
         assert_eq!(is_version_affected("3.9.0", "4.0.0", "4.18.0"), Some(false));
-        assert_eq!(is_version_affected("v1.2.3-rc1", "1.2.0", "1.2.3"), Some(true));
+        assert_eq!(
+            is_version_affected("v1.2.3-rc1", "1.2.0", "1.2.3"),
+            Some(true)
+        );
         assert_eq!(is_version_affected("1.2.3", "1.2.0", "1.2.3"), Some(false));
+    }
+
+    #[test]
+    fn supports_maven_and_pep440_suffixes() {
+        assert_eq!(
+            ParsedVersion::parse("1.2.3.RELEASE"),
+            ParsedVersion::parse("1.2.3")
+        );
+        assert_eq!(
+            ParsedVersion::parse("2.0.1.Final"),
+            ParsedVersion::parse("2.0.1")
+        );
+        assert_eq!(
+            is_version_affected("1.2.3.RELEASE", "1.0.0", "1.2.4"),
+            Some(true)
+        );
+        assert_eq!(is_version_affected("1.0a1", "0", "1.0.0"), Some(true));
+        assert!(ParsedVersion::parse("1.0a1").unwrap() < ParsedVersion::parse("1.0").unwrap());
+        assert!(ParsedVersion::parse("1.0.post1").unwrap() > ParsedVersion::parse("1.0").unwrap());
+        assert_eq!(is_version_affected("1.0.post1", "0", "1.0"), Some(false));
+        assert_eq!(is_version_affected("1.0.post1", "0", "1.1"), Some(true));
     }
 
     #[test]
     fn rejects_git_hashes_and_ranges_and_orders_prereleases() {
         // OSV git commit hashes starting with digits must not parse as numeric versions.
         assert_eq!(ParsedVersion::parse("9f8e7d6c5b4a3210"), None);
-        assert_eq!(is_version_affected("1.0.0", "9f8e7d6c5b4a3210", "2.0.0"), None);
+        assert_eq!(
+            is_version_affected("1.0.0", "9f8e7d6c5b4a3210", "2.0.0"),
+            None
+        );
 
         // Version range operators must not be silently coerced into exact versions.
         assert_eq!(ParsedVersion::parse(">=4.17.21"), None);
@@ -159,7 +321,13 @@ mod tests {
         let a2 = ParsedVersion::parse("1.0.0-alpha.2").unwrap();
         let a10 = ParsedVersion::parse("1.0.0-alpha.10").unwrap();
         assert!(a2 < a10);
-        assert_eq!(is_version_affected("1.0.0-alpha.2", "0", "1.0.0-alpha.10"), Some(true));
-        assert_eq!(is_version_affected("1.0.0-alpha.10", "0", "1.0.0-alpha.2"), Some(false));
+        assert_eq!(
+            is_version_affected("1.0.0-alpha.2", "0", "1.0.0-alpha.10"),
+            Some(true)
+        );
+        assert_eq!(
+            is_version_affected("1.0.0-alpha.10", "0", "1.0.0-alpha.2"),
+            Some(false)
+        );
     }
 }

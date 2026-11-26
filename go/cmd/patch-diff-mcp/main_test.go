@@ -48,7 +48,13 @@ func TestResolveSafePatchEndpointHardening(t *testing.T) {
 }
 
 func TestIsBlockedIP(t *testing.T) {
-	for _, s := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "192.168.1.5", "100.64.0.1", "::1", "fe80::1"} {
+	blocked := []string{
+		"127.0.0.1", "10.0.0.1", "169.254.169.254", "192.168.1.5",
+		"100.64.0.1", "::1", "fe80::1",
+		"64:ff9b::127.0.0.1", "2002:7f00:1::1", "198.18.0.1",
+		"192.0.0.1", "240.0.0.1", "255.255.255.255",
+	}
+	for _, s := range blocked {
 		if !isBlockedIP(net.ParseIP(s)) {
 			t.Fatalf("expected IP %s to be blocked", s)
 		}
@@ -58,18 +64,31 @@ func TestIsBlockedIP(t *testing.T) {
 	}
 }
 
-func TestExtractDiffHunks(t *testing.T) {
-	diff := `diff --git a/auth/check.go b/auth/check.go
-@@ -10,3 +10,5 @@ func check(p string)
-- if strings.HasPrefix(p, "/admin") {
-+ clean := filepath.Clean(p)
-+ if strings.HasPrefix(clean, "/admin") && verifyAuthToken() {`
+func TestExtractDiffHunksSpacesAndPrefixOperators(t *testing.T) {
+	diff := `diff --git a/my dir/auth check.sql b/my dir/auth check.sql
+--- a/my dir/auth check.sql
++++ b/my dir/auth check.sql
+@@ -10,3 +10,5 @@
+--- old SQL comment removed
++++count
++clean := filepath.Clean(p)
++if verifyAuthToken(tok) {
++author := "bob"
+`
 	res := extractDiffHunks(diff)
 	if res["files_changed"].(int) != 1 {
 		t.Fatalf("expected 1 changed file, got %v", res["files_changed"])
 	}
+	files := res["files"].([]fileDiffSummary)
+	if files[0].File != "my dir/auth check.sql" {
+		t.Fatalf("filename with spaces broken: %q", files[0].File)
+	}
+	// Removed SQL comment (---) and added ++count (+++) inside hunk must be counted!
+	if files[0].Removed != 1 || files[0].Added != 4 {
+		t.Fatalf("expected 1 removed and 4 added lines, got removed=%d added=%d", files[0].Removed, files[0].Added)
+	}
 	sigs := res["security_signals"].([]securitySignal)
-	if len(sigs) == 0 {
-		t.Fatalf("expected security signal on verifyAuthToken")
+	if len(sigs) != 2 {
+		t.Fatalf("expected exactly 2 security signals (filepath.Clean + verifyAuthToken), not noisy 'author': got %+v", sigs)
 	}
 }

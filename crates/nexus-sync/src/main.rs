@@ -5,7 +5,7 @@ mod scan;
 mod server;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use nexus_common::{CveRecord, detect_schema_version, open_readonly};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -76,34 +76,69 @@ enum Command {
         repo: String,
         #[arg(long, env = "ARTEX_NEXUS_DB_TAG", default_value = DEFAULT_TAG)]
         tag: String,
-        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        #[arg(
+            long,
+            env = "CVE_DB_PATH",
+            default_value = "data/cve_kb_med_plus.sqlite"
+        )]
         out: PathBuf,
-        #[arg(long, help = "Bypass ETag cache and force re-download")]
+        #[arg(long, help = "Bypass ETag/SHA cache and force re-download")]
         force: bool,
-        #[arg(long, help = "Allow installing an archive when SHA256SUMS.txt is absent")]
+        #[arg(
+            long,
+            help = "Allow installing an archive when SHA256SUMS.txt is absent"
+        )]
         allow_unverified: bool,
+        #[arg(
+            long,
+            env = "CVE_DB_SHA256",
+            help = "Optional out-of-band SHA-256 hex digest to pin archive authenticity"
+        )]
+        expected_sha256: Option<String>,
     },
     /// Build a small starter DB directly from live CISA KEV + FIRST EPSS
     SeedKev {
-        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        #[arg(
+            long,
+            env = "CVE_DB_PATH",
+            default_value = "data/cve_kb_med_plus.sqlite"
+        )]
         out: PathBuf,
     },
     /// Scan lockfiles and manifests offline against OSV/GHSA Medium+ CVE ranges
     Scan {
-        #[arg(long, default_value = ".", help = "Target directory or lockfile (10 formats)")]
+        #[arg(
+            long,
+            default_value = ".",
+            help = "Target directory or lockfile (10 formats)"
+        )]
         path: PathBuf,
-        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        #[arg(
+            long,
+            env = "CVE_DB_PATH",
+            default_value = "data/cve_kb_med_plus.sqlite"
+        )]
         db: PathBuf,
         #[arg(long, help = "Output raw JSON instead of text summary")]
         json: bool,
         #[arg(long, help = "Write SARIF 2.1.0 report to this file")]
         sarif: Option<PathBuf>,
-        #[arg(long, value_enum, help = "Exit non-zero if findings meet or exceed severity")]
+        #[arg(
+            long,
+            value_enum,
+            help = "Exit non-zero if findings meet or exceed severity"
+        )]
         fail_on: Option<SeverityThreshold>,
+        #[arg(long, default_value_t = 16, help = "Maximum directory traversal depth")]
+        max_depth: usize,
     },
     /// Check local DB integrity, schema version, and row counts
     Doctor {
-        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        #[arg(
+            long,
+            env = "CVE_DB_PATH",
+            default_value = "data/cve_kb_med_plus.sqlite"
+        )]
         db: PathBuf,
     },
     /// Print MCP client JSON config for Antigravity, ZCode, Freebuff, Claude, Cursor, or ARTEX
@@ -119,7 +154,11 @@ enum Command {
         host: String,
         #[arg(long, default_value_t = 8088)]
         port: u16,
-        #[arg(long, env = "CVE_DB_PATH", default_value = "data/cve_kb_med_plus.sqlite")]
+        #[arg(
+            long,
+            env = "CVE_DB_PATH",
+            default_value = "data/cve_kb_med_plus.sqlite"
+        )]
         db: PathBuf,
         #[arg(long, env = "SCOPE_STATE_DIR", default_value = "data/receipts")]
         receipts_dir: PathBuf,
@@ -134,66 +173,108 @@ enum Command {
         cors_origins: Vec<String>,
     },
     /// Configure a running ARTEX instance with the 4 MCPs, 8 skills, prompts, traffic binding, and caps
-    Bootstrap {
-        #[arg(long, env = "ARTEX_URL", default_value = "http://127.0.0.1:8787")]
-        artex_url: String,
-        #[arg(long, env = "ARTEX_UI_PASSWORD", default_value = "")]
-        password: String,
-        #[arg(long, env = "ARTEX_SETUP_TOKEN")]
-        setup_token: Option<String>,
-        #[arg(long, default_value = "127.0.0.1")]
-        mcp_host: String,
-        #[arg(long, help = "Use Docker Compose service hostnames for MCP URLs")]
-        docker_network: bool,
-        #[arg(long, default_value = "/opt/artex-nexus-knowledge")]
-        knowledge_dir: String,
-        #[arg(long, default_value = "/data")]
-        data_dir: String,
-        #[arg(long, default_value = "/config")]
-        config_dir: String,
-        #[arg(long, default_value = "http://127.0.0.1:8788")]
-        proxy_url: String,
-        #[arg(long, help = "LLM profile ID to bind to planner and mainagent")]
-        planner_profile_id: Option<i64>,
-        #[arg(long, help = "LLM profile ID to bind to worker/goals/auto/pentest/reporter/retester and global default")]
-        worker_profile_id: Option<i64>,
-        #[arg(long, default_value_t = 15)]
-        reporter_max_turns: i64,
-        #[arg(long, default_value_t = 300)]
-        reporter_run_seconds: i64,
-        #[arg(long, default_value_t = 25)]
-        retester_max_turns: i64,
-        #[arg(long, default_value_t = 600)]
-        retester_run_seconds: i64,
-        #[arg(long, help = "Optional host matcher for capture-proxy rewrite rule (e.g. *.example.com)")]
-        rewrite_host: Option<String>,
-        #[arg(long, help = "Optional request header to inject via capture proxy (e.g. X-Researcher-Id: handle)")]
-        rewrite_header: Option<String>,
-        #[arg(long, help = "Print bootstrap plan without modifying ARTEX")]
-        dry_run: bool,
-    },
+    Bootstrap(Box<BootstrapArgs>),
+}
+
+#[derive(Args)]
+struct BootstrapArgs {
+    #[arg(long, env = "ARTEX_URL", default_value = "http://127.0.0.1:8787")]
+    artex_url: String,
+    #[arg(
+        long,
+        env = "ARTEX_UI_PASSWORD",
+        default_value = "",
+        help = "Prefer ARTEX_UI_PASSWORD env, --password-file, or --password-stdin to avoid ps exposure"
+    )]
+    password: String,
+    #[arg(long, help = "Read ARTEX UI password from a file")]
+    password_file: Option<PathBuf>,
+    #[arg(long, help = "Read ARTEX UI password from stdin")]
+    password_stdin: bool,
+    #[arg(long, env = "ARTEX_SETUP_TOKEN")]
+    setup_token: Option<String>,
+    #[arg(long, default_value = "127.0.0.1")]
+    mcp_host: String,
+    #[arg(
+        long,
+        env = "MCP_AUTH_TOKEN",
+        help = "Bearer token to attach to HTTP MCP servers registered in ARTEX"
+    )]
+    mcp_auth_token: Option<String>,
+    #[arg(
+        long,
+        help = "Allow sending credentials over plain http:// to non-loopback hosts"
+    )]
+    allow_insecure_http: bool,
+    #[arg(long, help = "Use Docker Compose service hostnames for MCP URLs")]
+    docker_network: bool,
+    #[arg(long, default_value = "/opt/artex-nexus-knowledge")]
+    knowledge_dir: String,
+    #[arg(long, default_value = "/data")]
+    data_dir: String,
+    #[arg(long, default_value = "/config")]
+    config_dir: String,
+    #[arg(long, default_value = "http://127.0.0.1:8788")]
+    proxy_url: String,
+    #[arg(long, help = "LLM profile ID to bind to planner and mainagent")]
+    planner_profile_id: Option<i64>,
+    #[arg(
+        long,
+        help = "LLM profile ID to bind to worker/goals/auto/pentest/reporter/retester and global default"
+    )]
+    worker_profile_id: Option<i64>,
+    #[arg(long, default_value_t = 15)]
+    reporter_max_turns: i64,
+    #[arg(long, default_value_t = 300)]
+    reporter_run_seconds: i64,
+    #[arg(long, default_value_t = 25)]
+    retester_max_turns: i64,
+    #[arg(long, default_value_t = 600)]
+    retester_run_seconds: i64,
+    #[arg(
+        long,
+        help = "Optional host matcher for capture-proxy rewrite rule (e.g. *.example.com)"
+    )]
+    rewrite_host: Option<String>,
+    #[arg(
+        long,
+        help = "Optional request header to inject via capture proxy (e.g. X-Researcher-Id: handle)"
+    )]
+    rewrite_header: Option<String>,
+    #[arg(long, help = "Print bootstrap plan without modifying ARTEX")]
+    dry_run: bool,
 }
 
 fn cmd_doctor(db_path: &Path) -> Result<()> {
     let start = Instant::now();
     let conn = open_readonly(db_path)?;
-    let schema = detect_schema_version(&conn);
+    let schema = detect_schema_version(&conn)?;
     let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     let total_cves: i64 = conn.query_row("SELECT COUNT(*) FROM cves", [], |r| r.get(0))?;
     let total_writeups: i64 = conn.query_row("SELECT COUNT(*) FROM writeups", [], |r| r.get(0))?;
-    let kev_count: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| r.get(0))?;
+    let kev_count: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| {
+        r.get(0)
+    })?;
     let total_packages: i64 = if schema >= 2 {
         conn.query_row("SELECT COUNT(*) FROM cve_packages", [], |r| r.get(0))?
     } else {
         0
     };
     let writeups_with_text: i64 = if schema >= 2 {
-        conn.query_row("SELECT COUNT(*) FROM writeups WHERE length(content_excerpt) > 0", [], |r| r.get(0))?
+        conn.query_row(
+            "SELECT COUNT(*) FROM writeups WHERE length(content_excerpt) > 0",
+            [],
+            |r| r.get(0),
+        )?
     } else {
         0
     };
     let built_at: String = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'built_at'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'built_at'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or_else(|_| "unknown".to_string());
 
     println!(
@@ -239,10 +320,22 @@ fn cmd_init_mcp(client: McpClientKind, repo_root: &Path) -> Result<()> {
 
     let root = clean_abs_path(repo_root);
     let ext = if cfg!(windows) { ".exe" } else { "" };
-    let cve_bin = root.join("target").join("release").join(format!("cve-intel-mcp{ext}"));
-    let patch_bin = root.join("go").join("bin").join(format!("patch-diff-mcp{ext}"));
-    let scope_bin = root.join("go").join("bin").join(format!("scope-guard-mcp{ext}"));
-    let surface_bin = root.join("go").join("bin").join(format!("attack-surface-mcp{ext}"));
+    let cve_bin = root
+        .join("target")
+        .join("release")
+        .join(format!("cve-intel-mcp{ext}"));
+    let patch_bin = root
+        .join("go")
+        .join("bin")
+        .join(format!("patch-diff-mcp{ext}"));
+    let scope_bin = root
+        .join("go")
+        .join("bin")
+        .join(format!("scope-guard-mcp{ext}"));
+    let surface_bin = root
+        .join("go")
+        .join("bin")
+        .join(format!("attack-surface-mcp{ext}"));
     let db_path = root.join("data").join("cve_kb_med_plus.sqlite");
     let cfg_dir = root.join("config");
     let state_dir = root.join("data").join("receipts");
@@ -385,7 +478,15 @@ fn main() -> Result<()> {
             out,
             force,
             allow_unverified,
-        } => fetch::cmd_fetch(&repo, &tag, &out, force, allow_unverified)?,
+            expected_sha256,
+        } => fetch::cmd_fetch(
+            &repo,
+            &tag,
+            &out,
+            force,
+            allow_unverified,
+            expected_sha256.as_deref(),
+        )?,
         Command::SeedKev { out } => ingest::cmd_seed_kev(&out)?,
         Command::Scan {
             path,
@@ -393,7 +494,8 @@ fn main() -> Result<()> {
             json,
             sarif,
             fail_on,
-        } => scan::cmd_scan(&path, &db, json, sarif.as_deref(), fail_on)?,
+            max_depth,
+        } => scan::cmd_scan(&path, &db, json, sarif.as_deref(), fail_on, max_depth)?,
         Command::Doctor { db } => cmd_doctor(&db)?,
         Command::InitMcp { client, repo_root } => cmd_init_mcp(client, &repo_root)?,
         Command::Serve {
@@ -404,31 +506,51 @@ fn main() -> Result<()> {
             knowledge_dir,
             cors_origins,
         } => server::cmd_serve(&host, port, db, receipts_dir, knowledge_dir, cors_origins)?,
-        Command::Bootstrap {
-            artex_url,
-            password,
-            setup_token,
-            mcp_host,
-            docker_network,
-            knowledge_dir,
-            data_dir,
-            config_dir,
-            proxy_url,
-            planner_profile_id,
-            worker_profile_id,
-            reporter_max_turns,
-            reporter_run_seconds,
-            retester_max_turns,
-            retester_run_seconds,
-            rewrite_host,
-            rewrite_header,
-            dry_run,
-        } => {
+        Command::Bootstrap(args) => {
+            let BootstrapArgs {
+                artex_url,
+                mut password,
+                password_file,
+                password_stdin,
+                setup_token,
+                mcp_host,
+                mcp_auth_token,
+                allow_insecure_http,
+                docker_network,
+                knowledge_dir,
+                data_dir,
+                config_dir,
+                proxy_url,
+                planner_profile_id,
+                worker_profile_id,
+                reporter_max_turns,
+                reporter_run_seconds,
+                retester_max_turns,
+                retester_run_seconds,
+                rewrite_host,
+                rewrite_header,
+                dry_run,
+            } = *args;
+            if std::env::args().any(|a| a == "--password" || a.starts_with("--password=")) {
+                eprintln!(
+                    "[!] Warning: passing --password on the command line exposes it in process listings; prefer ARTEX_UI_PASSWORD, --password-file, or --password-stdin."
+                );
+            }
+            if let Some(pf) = password_file {
+                password = fs::read_to_string(&pf)?.trim().to_string();
+            } else if password_stdin {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                password = buf.trim().to_string();
+            }
             let out = bootstrap::cmd_bootstrap(&bootstrap::BootstrapConfig {
                 artex_url,
                 password,
                 setup_token,
                 mcp_host,
+                mcp_auth_token,
+                allow_insecure_http,
                 docker_network,
                 knowledge_dir,
                 data_dir,
@@ -467,7 +589,9 @@ mod tests {
 
     fn sample_cve(id: &str, score: Option<f64>, cwe: &str, state: &str) -> Value {
         let metrics = match score {
-            Some(s) => json!([{"cvssV3_1": {"version": "3.1", "baseScore": s, "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}]),
+            Some(s) => {
+                json!([{"cvssV3_1": {"version": "3.1", "baseScore": s, "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}])
+            }
             None => json!([]),
         };
         json!({
@@ -505,14 +629,35 @@ mod tests {
                 cwes: vec!["CWE-79".to_string()],
             },
         );
-        let rec = parse_cve5_value(&sample_cve("CVE-2026-0001", None, "CWE-79", "PUBLISHED"), &kev, &HashMap::new(), 4.0)
-            .expect("unscored KEV must be kept");
+        let rec = parse_cve5_value(
+            &sample_cve("CVE-2026-0001", None, "CWE-79", "PUBLISHED"),
+            &kev,
+            &HashMap::new(),
+            4.0,
+        )
+        .expect("unscored KEV must be kept");
         assert!(rec.cvss_score.is_none());
         assert_eq!(rec.cvss_severity, "KEV_UNSCORED");
         assert_eq!(rec.exploit_maturity, "KEV_EXPLOITED");
 
-        assert!(parse_cve5_value(&sample_cve("CVE-2026-0002", Some(3.1), "CWE-79", "PUBLISHED"), &kev, &HashMap::new(), 4.0).is_none());
-        assert!(parse_cve5_value(&sample_cve("CVE-2026-0003", Some(9.8), "CWE-79", "REJECTED"), &kev, &HashMap::new(), 4.0).is_none());
+        assert!(
+            parse_cve5_value(
+                &sample_cve("CVE-2026-0002", Some(3.1), "CWE-79", "PUBLISHED"),
+                &kev,
+                &HashMap::new(),
+                4.0
+            )
+            .is_none()
+        );
+        assert!(
+            parse_cve5_value(
+                &sample_cve("CVE-2026-0003", Some(9.8), "CWE-79", "REJECTED"),
+                &kev,
+                &HashMap::new(),
+                4.0
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -537,8 +682,20 @@ mod tests {
         )
         .unwrap();
 
-        let r1 = parse_cve5_value(&sample_cve("CVE-2026-1000", Some(9.1), "CWE-79", "PUBLISHED"), &HashMap::new(), &HashMap::new(), 4.0).unwrap();
-        let r2 = parse_cve5_value(&sample_cve("CVE-2026-1001", Some(8.2), "CWE-798", "PUBLISHED"), &HashMap::new(), &HashMap::new(), 4.0).unwrap();
+        let r1 = parse_cve5_value(
+            &sample_cve("CVE-2026-1000", Some(9.1), "CWE-79", "PUBLISHED"),
+            &HashMap::new(),
+            &HashMap::new(),
+            4.0,
+        )
+        .unwrap();
+        let r2 = parse_cve5_value(
+            &sample_cve("CVE-2026-1001", Some(8.2), "CWE-798", "PUBLISHED"),
+            &HashMap::new(),
+            &HashMap::new(),
+            4.0,
+        )
+        .unwrap();
         write_records_to_db(&db, &[r1, r2], 4.0, None, None, Some(&osv_dir)).unwrap();
 
         let conn = Connection::open(&db).unwrap();
@@ -572,9 +729,21 @@ mod tests {
         )
         .unwrap();
         let go_deps = parse_dependencies_from_file(&gomod);
-        assert!(go_deps.contains(&("Go".to_string(), "github.com/foo/bar".to_string(), "1.2.3".to_string())));
-        assert!(go_deps.contains(&("Go".to_string(), "golang.org/x/net".to_string(), "0.20.0".to_string())));
-        assert!(!go_deps.iter().any(|(_, n, _)| n.contains("excluded") || n.contains("replaced")));
+        assert!(go_deps.contains(&(
+            "Go".to_string(),
+            "github.com/foo/bar".to_string(),
+            "1.2.3".to_string()
+        )));
+        assert!(go_deps.contains(&(
+            "Go".to_string(),
+            "golang.org/x/net".to_string(),
+            "0.20.0".to_string()
+        )));
+        assert!(
+            !go_deps
+                .iter()
+                .any(|(_, n, _)| n.contains("excluded") || n.contains("replaced"))
+        );
 
         let reqs = dir.path().join("requirements.txt");
         fs::write(
@@ -583,8 +752,16 @@ mod tests {
         )
         .unwrap();
         let py_deps = parse_dependencies_from_file(&reqs);
-        assert!(py_deps.contains(&("PyPI".to_string(), "requests".to_string(), "2.28.0".to_string())));
-        assert!(py_deps.contains(&("PyPI".to_string(), "urllib3".to_string(), "1.26.5".to_string())));
+        assert!(py_deps.contains(&(
+            "PyPI".to_string(),
+            "requests".to_string(),
+            "2.28.0".to_string()
+        )));
+        assert!(py_deps.contains(&(
+            "PyPI".to_string(),
+            "urllib3".to_string(),
+            "1.26.5".to_string()
+        )));
 
         let pkgjson = dir.path().join("package.json");
         fs::write(
@@ -593,7 +770,14 @@ mod tests {
         )
         .unwrap();
         let npm_deps = parse_dependencies_from_file(&pkgjson);
-        assert_eq!(npm_deps, vec![("npm".to_string(), "lodash".to_string(), "4.17.15".to_string())]);
+        assert_eq!(
+            npm_deps,
+            vec![(
+                "npm".to_string(),
+                "lodash".to_string(),
+                "4.17.15".to_string()
+            )]
+        );
 
         let yarn = dir.path().join("yarn.lock");
         fs::write(
@@ -602,8 +786,50 @@ mod tests {
         )
         .unwrap();
         let yarn_deps = parse_dependencies_from_file(&yarn);
-        assert!(yarn_deps.contains(&("npm".to_string(), "@babel/core".to_string(), "7.24.0".to_string())));
-        assert!(yarn_deps.contains(&("npm".to_string(), "lodash".to_string(), "4.17.15".to_string())));
+        assert!(yarn_deps.contains(&(
+            "npm".to_string(),
+            "@babel/core".to_string(),
+            "7.24.0".to_string()
+        )));
+        assert!(yarn_deps.contains(&(
+            "npm".to_string(),
+            "lodash".to_string(),
+            "4.17.15".to_string()
+        )));
+
+        // pom.xml ${prop} resolution and PyPI PEP 503 normalization.
+        let pom = dir.path().join("pom.xml");
+        fs::write(
+            &pom,
+            "<project><properties><log4j.version>2.14.1</log4j.version></properties><dependencies><dependency><groupId>org.apache.logging.log4j</groupId><artifactId>log4j-core</artifactId><version>${log4j.version}</version></dependency><dependency><groupId>com.example</groupId><artifactId>unknown</artifactId><version>${missing.ver}</version></dependency></dependencies></project>",
+        )
+        .unwrap();
+        let pom_parsed = scan::parse_manifest_file(&pom);
+        assert_eq!(
+            pom_parsed.deps,
+            vec![(
+                "Maven".to_string(),
+                "org.apache.logging.log4j:log4j-core".to_string(),
+                "2.14.1".to_string()
+            )]
+        );
+        assert_eq!(pom_parsed.skipped_unpinned, 1);
+
+        let py_norm = dir.path().join("requirements.txt");
+        fs::write(&py_norm, "Flask_Login==0.6.2\n").unwrap();
+        assert_eq!(
+            parse_dependencies_from_file(&py_norm),
+            vec![(
+                "PyPI".to_string(),
+                "flask-login".to_string(),
+                "0.6.2".to_string()
+            )]
+        );
+
+        // fetch repo/tag validation rejects traversal/injection.
+        assert!(fetch::validate_repo_and_tag("org/repo", "cve-db-latest").is_ok());
+        assert!(fetch::validate_repo_and_tag("org/../evil", "cve-db-latest").is_err());
+        assert!(fetch::validate_repo_and_tag("org/repo", "tag?foo=bar").is_err());
 
         let sarif = build_sarif_report(&[json!({
             "file": "package-lock.json",
@@ -702,7 +928,11 @@ mod tests {
         let knowledge_dir = dir.path().join("knowledge");
         fs::create_dir_all(&receipts_dir).unwrap();
         fs::create_dir_all(&knowledge_dir).unwrap();
-        fs::write(knowledge_dir.join("demo-playbook.md"), "# Demo Playbook\nCheck BOLA.\n").unwrap();
+        fs::write(
+            knowledge_dir.join("demo-playbook.md"),
+            "# Demo Playbook\nCheck BOLA.\n",
+        )
+        .unwrap();
         let mut server = spawn_dashboard(
             "127.0.0.1:0",
             db,
@@ -722,7 +952,12 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(evil_resp.status().as_u16(), 403);
-        assert!(evil_resp.headers().get("access-control-allow-origin").is_none());
+        assert!(
+            evil_resp
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
 
         // DNS-rebinding unknown Host header must be rejected with 403.
         let rebind_resp = client
@@ -739,14 +974,21 @@ mod tests {
             .send()
             .unwrap();
         assert_eq!(
-            ok_resp.headers().get("access-control-allow-origin").unwrap().to_str().unwrap(),
+            ok_resp
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "http://127.0.0.1:8787"
         );
         let stats: Value = ok_resp.json().unwrap();
         assert_eq!(stats["metadata"]["total_cves"], "1");
 
         let pkg: Value = client
-            .get(format!("http://{addr}/api/package?ecosystem=npm&name=lodash-demo&version=4.17.15"))
+            .get(format!(
+                "http://{addr}/api/package?ecosystem=npm&name=lodash-demo&version=4.17.15"
+            ))
             .send()
             .unwrap()
             .json()
@@ -760,10 +1002,19 @@ mod tests {
     #[test]
     fn ingest_fixes_classify_trickest_lessthan_and_epss_stream() {
         // classify_reference must not treat generic github.com repos or random 'advisories' substrings as writeups.
-        assert_eq!(classify_reference("https://github.com/org/repo/issues/42", &[]), ("reference", false));
-        assert_eq!(classify_reference("https://example.test/my-advisories-page", &[]), ("reference", false));
         assert_eq!(
-            classify_reference("https://github.com/org/repo/security/advisories/GHSA-1234", &[]),
+            classify_reference("https://github.com/org/repo/issues/42", &[]),
+            ("reference", false)
+        );
+        assert_eq!(
+            classify_reference("https://example.test/my-advisories-page", &[]),
+            ("reference", false)
+        );
+        assert_eq!(
+            classify_reference(
+                "https://github.com/org/repo/security/advisories/GHSA-1234",
+                &[]
+            ),
             ("advisory", false)
         );
         assert_eq!(
@@ -793,11 +1044,26 @@ Test
             .iter()
             .map(|r| (r.url.as_str(), r.source.as_str()))
             .collect();
-        assert_eq!(by_url["https://github.com/vendor/app/issues/9"], "trickest:writeup");
-        assert_eq!(by_url["https://github.com/vendor/app/security/advisories/GHSA-aaaa"], "trickest:writeup");
-        assert_eq!(by_url["https://github.com/vendor/app/commit/1234567"], "trickest:patch");
-        assert_eq!(by_url["https://github.com/vendor/app/pull/10"], "trickest:patch");
-        assert_eq!(by_url["https://github.com/researcher/CVE-2026-5000-poc"], "trickest:poc");
+        assert_eq!(
+            by_url["https://github.com/vendor/app/issues/9"],
+            "trickest:writeup"
+        );
+        assert_eq!(
+            by_url["https://github.com/vendor/app/security/advisories/GHSA-aaaa"],
+            "trickest:writeup"
+        );
+        assert_eq!(
+            by_url["https://github.com/vendor/app/commit/1234567"],
+            "trickest:patch"
+        );
+        assert_eq!(
+            by_url["https://github.com/vendor/app/pull/10"],
+            "trickest:patch"
+        );
+        assert_eq!(
+            by_url["https://github.com/researcher/CVE-2026-5000-poc"],
+            "trickest:poc"
+        );
 
         // lessThan / lessThanOrEqual upper bounds must be preserved in affected_products.
         let cve_ranges = json!({
@@ -818,7 +1084,10 @@ Test
             }
         });
         let rec = parse_cve5_value(&cve_ranges, &HashMap::new(), &HashMap::new(), 4.0).unwrap();
-        assert_eq!(rec.affected_products[0].versions, vec![">= 1.0.0, < 1.5.0", "<= 0.9.9"]);
+        assert_eq!(
+            rec.affected_products[0].versions,
+            vec![">= 1.0.0, < 1.5.0", "<= 0.9.9"]
+        );
 
         // Streaming EPSS reader handles comment lines + header without double-copying.
         let epss_csv = "#model_version:v2025.03.14,score_date:2026-01-01\ncve,epss,percentile\nCVE-2026-0001,0.42,0.98\n";
@@ -833,6 +1102,8 @@ Test
             password: "test".to_string(),
             setup_token: None,
             mcp_host: "127.0.0.1".to_string(),
+            mcp_auth_token: None,
+            allow_insecure_http: false,
             docker_network: false,
             knowledge_dir: "/opt/knowledge".to_string(),
             data_dir: "/data".to_string(),

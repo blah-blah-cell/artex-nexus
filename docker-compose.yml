@@ -22,18 +22,25 @@ services:
       postgres:
         condition: service_healthy
       cve-intel-mcp:
-        condition: service_started
+        condition: service_healthy
       patch-diff-mcp:
-        condition: service_started
+        condition: service_healthy
       scope-guard-mcp:
-        condition: service_started
+        condition: service_healthy
       attack-surface-mcp:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "127.0.0.1:${ARTEX_PORT:-8787}:8787"
     environment:
-      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-artex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex}?sslmode=disable
+      # Use discrete PG env vars so passwords containing '@', '/', ':', or '?' are percent-encoded safely.
+      ARTEX_PG_HOST: postgres
+      ARTEX_PG_PORT: "5432"
+      ARTEX_PG_USER: ${POSTGRES_USER:-artex}
+      ARTEX_PG_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      ARTEX_PG_DBNAME: ${POSTGRES_DB:-artex}
+      ARTEX_PG_SSLMODE: disable
       ARTEX_SKILL_DIR: /opt/artex-nexus-skills
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
@@ -58,7 +65,9 @@ services:
     restart: unless-stopped
     command: ["cve-intel-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8901", "--db-path", "/data/cve_kb_med_plus.sqlite"]
     environment:
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env}
+      HEALTH_PORT: "8901"
+      HEALTH_PATH: "/health"
     ports:
       - "127.0.0.1:8901:8901"
     volumes:
@@ -72,7 +81,9 @@ services:
     command: ["patch-diff-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8902"]
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env}
+      HEALTH_PORT: "8902"
+      HEALTH_PATH: "/health"
     ports:
       - "127.0.0.1:8902:8902"
 
@@ -84,7 +95,10 @@ services:
     command: ["scope-guard-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8903", "--config-dir", "/config", "--state-dir", "/state/receipts"]
     environment:
       SCOPE_DEFAULT_POLICY: ${SCOPE_DEFAULT_POLICY:-}
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      SCOPE_LEDGER_HMAC_KEY: ${SCOPE_LEDGER_HMAC_KEY:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env}
+      HEALTH_PORT: "8903"
+      HEALTH_PATH: "/health"
     ports:
       - "127.0.0.1:8903:8903"
     volumes:
@@ -99,7 +113,9 @@ services:
     command: ["attack-surface-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "8904", "--workspace-dir", "/workspace"]
     environment:
       ATTACK_SURFACE_ROOT: /workspace
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?Set MCP_AUTH_TOKEN in .env}
+      HEALTH_PORT: "8904"
+      HEALTH_PATH: "/health"
     ports:
       - "127.0.0.1:8904:8904"
     volumes:
@@ -113,6 +129,8 @@ services:
     command: ["nexus-sync", "serve", "--host", "0.0.0.0", "--port", "8088", "--db", "/data/cve_kb_med_plus.sqlite", "--receipts-dir", "/state/receipts", "--knowledge-dir", "/opt/artex-nexus-knowledge"]
     environment:
       NEXUS_CORS_ORIGINS: ${NEXUS_CORS_ORIGINS:-http://127.0.0.1:8787,http://localhost:8787}
+      HEALTH_PORT: "8088"
+      HEALTH_PATH: "/api/stats"
     ports:
       - "127.0.0.1:8088:8088"
     volumes:

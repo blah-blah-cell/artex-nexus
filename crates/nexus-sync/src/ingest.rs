@@ -196,7 +196,8 @@ fn host_matches(host: &str, domain: &str) -> bool {
 
 pub fn classify_reference(url: &str, tags: &[String]) -> (&'static str, bool) {
     let lower_tags: HashSet<String> = tags.iter().map(|t| t.to_lowercase()).collect();
-    let has_patch = lower_tags.contains("patch") || patch_patterns().iter().any(|p| p.is_match(url));
+    let has_patch =
+        lower_tags.contains("patch") || patch_patterns().iter().any(|p| p.is_match(url));
     if has_patch {
         return ("patch", true);
     }
@@ -250,7 +251,11 @@ pub fn parse_cve5_value(
     if meta.get("state").and_then(Value::as_str) == Some("REJECTED") {
         return None;
     }
-    let cve_id = meta.get("cveId").and_then(Value::as_str)?.trim().to_uppercase();
+    let cve_id = meta
+        .get("cveId")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_uppercase();
     if !cve_id.starts_with("CVE-") {
         return None;
     }
@@ -294,7 +299,11 @@ pub fn parse_cve5_value(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .or_else(|| kev_entry.map(|k| k.vulnerability_name.as_str()).filter(|s| !s.is_empty()))
+        .or_else(|| {
+            kev_entry
+                .map(|k| k.vulnerability_name.as_str())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or("")
         .to_string();
 
@@ -338,8 +347,18 @@ pub fn parse_cve5_value(
     let mut affected_products = Vec::new();
     if let Some(arr) = cna.get("affected").and_then(Value::as_array) {
         for item in arr.iter().take(25) {
-            let vendor = item.get("vendor").and_then(Value::as_str).unwrap_or("").trim().to_string();
-            let product = item.get("product").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let vendor = item
+                .get("vendor")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let product = item
+                .get("product")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let versions: Vec<String> = item
                 .get("versions")
                 .and_then(Value::as_array)
@@ -363,7 +382,9 @@ pub fn parse_cve5_value(
                                 });
                             match (start, upper) {
                                 (Some(s), Some(u))
-                                    if s == "0" || s == "*" || s.eq_ignore_ascii_case("unspecified") =>
+                                    if s == "0"
+                                        || s == "*"
+                                        || s.eq_ignore_ascii_case("unspecified") =>
                                 {
                                     Some(u)
                                 }
@@ -378,7 +399,11 @@ pub fn parse_cve5_value(
                 })
                 .unwrap_or_default();
             if !vendor.is_empty() || !product.is_empty() {
-                affected_products.push(AffectedProduct { vendor, product, versions });
+                affected_products.push(AffectedProduct {
+                    vendor,
+                    product,
+                    versions,
+                });
             }
         }
     }
@@ -410,7 +435,12 @@ pub fn parse_cve5_value(
         let tags: Vec<String> = r
             .get("tags")
             .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
             .unwrap_or_default();
         let (src, has_patch) = classify_reference(url, &tags);
         if src == "poc" {
@@ -457,8 +487,16 @@ pub fn parse_cve5_value(
 
     Some(CveRecord {
         cve_id,
-        published_date: meta.get("datePublished").and_then(Value::as_str).unwrap_or("").to_string(),
-        modified_date: meta.get("dateUpdated").and_then(Value::as_str).unwrap_or("").to_string(),
+        published_date: meta
+            .get("datePublished")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        modified_date: meta
+            .get("dateUpdated")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         cvss_score: score,
         cvss_version: ver,
         cvss_severity: sev,
@@ -504,7 +542,12 @@ fn is_github_poc_url(url: &str, in_github_section: bool) -> bool {
     {
         return false;
     }
-    let segs: Vec<&str> = parsed.path().trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = parsed
+        .path()
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     segs.len() >= 2
 }
 
@@ -550,7 +593,11 @@ pub fn parse_trickest_markdown(cid: &str, text: &str) -> Vec<WriteupRecord> {
     out
 }
 
-fn ingest_trickest(conn: &mut Connection, trickest_dir: &Path, existing: &HashSet<String>) -> Result<usize> {
+fn ingest_trickest(
+    conn: &mut Connection,
+    trickest_dir: &Path,
+    existing: &HashSet<String>,
+) -> Result<usize> {
     let md_files: Vec<PathBuf> = WalkDir::new(trickest_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -611,7 +658,11 @@ fn ingest_trickest(conn: &mut Connection, trickest_dir: &Path, existing: &HashSe
     Ok(inserted)
 }
 
-fn ingest_nuclei(conn: &mut Connection, nuclei_dir: &Path, existing: &HashSet<String>) -> Result<usize> {
+fn ingest_nuclei(
+    conn: &mut Connection,
+    nuclei_dir: &Path,
+    existing: &HashSet<String>,
+) -> Result<usize> {
     let yaml_files: Vec<(String, String, String)> = WalkDir::new(nuclei_dir)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -628,8 +679,13 @@ fn ingest_nuclei(conn: &mut Connection, nuclei_dir: &Path, existing: &HashSet<St
             if !existing.contains(&cid) {
                 return None;
             }
-            let rel = p.strip_prefix(nuclei_dir).ok()?.to_string_lossy().replace('\\', "/");
-            let url = format!("https://github.com/projectdiscovery/nuclei-templates/blob/main/{rel}");
+            let rel = p
+                .strip_prefix(nuclei_dir)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let url =
+                format!("https://github.com/projectdiscovery/nuclei-templates/blob/main/{rel}");
             Some((cid, stem, url))
         })
         .collect();
@@ -642,8 +698,8 @@ fn ingest_nuclei(conn: &mut Connection, nuclei_dir: &Path, existing: &HashSet<St
              VALUES (?1, 'nuclei', ?2, ?3, 'nuclei-template', 0, '')",
         )?;
         let mut upd = tx.prepare_cached(
-            "UPDATE cves SET exploit_maturity = 'NUCLEI_VERIFIED'
-             WHERE cve_id = ?1 AND exploit_maturity != 'KEV_EXPLOITED'",
+            "UPDATE cves SET exploit_maturity = 'NUCLEI_TEMPLATE'
+             WHERE cve_id = ?1 AND exploit_maturity IN ('NONE', 'PATCH_ONLY')",
         )?;
         for (cid, stem, url) in &yaml_files {
             inserted += stmt.execute(params![cid, url, stem])?;
@@ -654,13 +710,16 @@ fn ingest_nuclei(conn: &mut Connection, nuclei_dir: &Path, existing: &HashSet<St
     Ok(inserted)
 }
 
-fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>) -> Result<(usize, usize)> {
+fn ingest_osv(
+    conn: &mut Connection,
+    osv_dir: &Path,
+    existing: &HashSet<String>,
+) -> Result<(usize, usize)> {
     let json_files: Vec<PathBuf> = WalkDir::new(osv_dir)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_type().is_file()
-                && e.path().extension().and_then(|s| s.to_str()) == Some("json")
+            e.file_type().is_file() && e.path().extension().and_then(|s| s.to_str()) == Some("json")
         })
         .map(|e| e.into_path())
         .collect();
@@ -670,7 +729,11 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
         .filter_map(|p| {
             let raw = fs::read_to_string(p).ok()?;
             let v: Value = serde_json::from_str(&raw).ok()?;
-            let adv_id = v.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let adv_id = v
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let aliases: Vec<String> = v
                 .get("aliases")
                 .and_then(Value::as_array)
@@ -685,8 +748,16 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
             if aliases.is_empty() {
                 return None;
             }
-            let summary = v.get("summary").and_then(Value::as_str).unwrap_or("").trim();
-            let details = v.get("details").and_then(Value::as_str).unwrap_or("").trim();
+            let summary = v
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let details = v
+                .get("details")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             let excerpt: String = details.chars().take(2000).collect();
 
             let mut pkgs = Vec::new();
@@ -736,7 +807,9 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
                                 let mut intro: Option<String> = None;
                                 if let Some(events) = rng.get("events").and_then(Value::as_array) {
                                     for ev in events {
-                                        if let Some(i) = ev.get("introduced").and_then(Value::as_str) {
+                                        if let Some(i) =
+                                            ev.get("introduced").and_then(Value::as_str)
+                                        {
                                             if let Some(prev_intro) = intro.take() {
                                                 pkgs.push(PackageRange {
                                                     cve_id: cid.clone(),
@@ -760,7 +833,8 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
                                                     .map(|la| format!("<={la}"))
                                             });
                                         if let Some(fixed) = close_ver {
-                                            let start_ver = intro.take().unwrap_or_else(|| "0".to_string());
+                                            let start_ver =
+                                                intro.take().unwrap_or_else(|| "0".to_string());
                                             pkgs.push(PackageRange {
                                                 cve_id: cid.clone(),
                                                 ecosystem: ecosystem.clone(),
@@ -800,8 +874,13 @@ fn ingest_osv(conn: &mut Connection, osv_dir: &Path, existing: &HashSet<String>)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         let mut w_stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO writeups (cve_id, source, url, title, tags, has_patch_diff, content_excerpt)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO writeups (cve_id, source, url, title, tags, has_patch_diff, content_excerpt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(cve_id, source, url) DO UPDATE SET
+               title = CASE WHEN length(excluded.title) > length(writeups.title) THEN excluded.title ELSE writeups.title END,
+               tags = excluded.tags,
+               has_patch_diff = MAX(writeups.has_patch_diff, excluded.has_patch_diff),
+               content_excerpt = CASE WHEN length(excluded.content_excerpt) > length(writeups.content_excerpt) THEN excluded.content_excerpt ELSE writeups.content_excerpt END",
         )?;
         for (pkgs, wus) in parsed {
             for p in pkgs {
@@ -939,8 +1018,11 @@ pub fn write_records_to_db(
 
     let total_cves: i64 = conn.query_row("SELECT COUNT(*) FROM cves", [], |r| r.get(0))?;
     let total_writeups: i64 = conn.query_row("SELECT COUNT(*) FROM writeups", [], |r| r.get(0))?;
-    let total_packages: i64 = conn.query_row("SELECT COUNT(*) FROM cve_packages", [], |r| r.get(0))?;
-    let kev_count: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| r.get(0))?;
+    let total_packages: i64 =
+        conn.query_row("SELECT COUNT(*) FROM cve_packages", [], |r| r.get(0))?;
+    let kev_count: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| {
+        r.get(0)
+    })?;
     let writeups_with_text: i64 = conn.query_row(
         "SELECT COUNT(*) FROM writeups WHERE length(content_excerpt) > 0",
         [],
@@ -999,7 +1081,10 @@ pub fn compress_zstd(db_path: &Path) -> Result<(PathBuf, String)> {
         hasher.update(&buf[..n]);
     }
     let digest = hex::encode(hasher.finalize());
-    let sums_path = out_path.parent().unwrap_or(Path::new(".")).join("SHA256SUMS.txt");
+    let sums_path = out_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("SHA256SUMS.txt");
     fs::write(
         &sums_path,
         format!(

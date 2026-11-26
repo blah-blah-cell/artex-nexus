@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -24,50 +25,55 @@ const (
 	maxScanFiles    = 2000
 	maxFileSizeByte = 1 << 20
 	maxSpecSizeByte = 16 << 20
+	maxLineBytes    = 1 << 20
 )
 
 type sinkRule struct {
-	ID       string
-	CWE      string
-	Severity string
-	Title    string
-	Exts     map[string]bool
-	Pattern  *regexp.Regexp
+	ID         string
+	CWE        string
+	Severity   string
+	Confidence string
+	Title      string
+	Exts       map[string]bool
+	Pattern    *regexp.Regexp
+	Exclude    *regexp.Regexp
 }
 
 var sinkRules = []sinkRule{
 	{
-		ID: "CMD_EXEC_SHELL", CWE: "CWE-78", Severity: "HIGH",
+		ID: "CMD_EXEC_SHELL", CWE: "CWE-78", Severity: "HIGH", Confidence: "high",
 		Title:   "OS command execution sink (check shell metacharacter and argv isolation)",
 		Exts:    extSet(".py", ".js", ".ts", ".jsx", ".tsx", ".php", ".rb", ".go"),
-		Pattern: regexp.MustCompile(`(?i)(shell\s*=\s*True|child_process\.(exec|execSync)\s*\(|os\.system\s*\(|subprocess\.(Popen|call|run)\s*\([^)]*shell|exec\.Command\s*\(\s*"(sh|bash|cmd)"|\b(shell_exec|passthru|proc_open)\s*\()`),
+		Pattern: regexp.MustCompile(`(?i)(shell\s*=\s*True|child_process\.(exec|execSync)\s*\(|os\.system\s*\(|subprocess\.(Popen|call|run)\s*\([^)]*shell\s*=\s*True|exec\.Command\s*\(\s*"(sh|bash|cmd)"|\b(shell_exec|passthru|proc_open)\s*\()`),
 	},
 	{
-		ID: "DYNAMIC_SQL_CONCAT", CWE: "CWE-89", Severity: "HIGH",
+		ID: "DYNAMIC_SQL_CONCAT", CWE: "CWE-89", Severity: "HIGH", Confidence: "medium",
 		Title:   "Dynamic SQL query formatting or concatenation (check parameterization)",
 		Exts:    extSet(".py", ".js", ".ts", ".go", ".java", ".php", ".rb", ".cs"),
-		Pattern: regexp.MustCompile(`(?i)(SELECT|INSERT|UPDATE|DELETE)\s+.{0,80}(\+\s*[a-zA-Z_]|%s|\$\{|\.format\s*\(|f["'])`),
+		// Avoid flagging parameterized %s placeholders (psycopg2/MySQLdb); match concatenation, template interpolation, .format, f-strings, or % formatting.
+		Pattern: regexp.MustCompile(`(?i)(f["']\s*(SELECT|INSERT|UPDATE|DELETE)\b[^"']*\{|(SELECT|INSERT|UPDATE|DELETE)\s+.{0,80}(\+\s*[a-zA-Z_][a-zA-Z0-9_]*|\$\{|\.format\s*\(|["']\s*%\s*[a-zA-Z_(]))`),
 	},
 	{
-		ID: "UNSAFE_DESERIALIZE", CWE: "CWE-502", Severity: "CRITICAL",
+		ID: "UNSAFE_DESERIALIZE", CWE: "CWE-502", Severity: "CRITICAL", Confidence: "high",
 		Title:   "Unsafe deserialization sink (pickle/yaml.load/ObjectInputStream/unserialize)",
 		Exts:    extSet(".py", ".java", ".php", ".rb", ".js", ".ts"),
 		Pattern: regexp.MustCompile(`(pickle\.(loads|load)\s*\(|yaml\.load\s*\([^)]*\)|ObjectInputStream|readObject\s*\(|\bunserialize\s*\(|Marshal\.load\s*\(|node-serialize)`),
+		Exclude: regexp.MustCompile(`yaml\.load\s*\([^)]*Loader\s*=\s*(yaml\.)?(C?SafeLoader|C?BaseLoader)`),
 	},
 	{
-		ID: "DOM_XSS_SINK", CWE: "CWE-79", Severity: "MEDIUM",
+		ID: "DOM_XSS_SINK", CWE: "CWE-79", Severity: "MEDIUM", Confidence: "medium",
 		Title:   "DOM or template HTML injection sink (check sanitization)",
 		Exts:    extSet(".js", ".ts", ".jsx", ".tsx", ".vue", ".svelte", ".html"),
 		Pattern: regexp.MustCompile(`(dangerouslySetInnerHTML|\.innerHTML\s*=|\.outerHTML\s*=|document\.write\s*\(|v-html\s*=|\[innerHTML\])`),
 	},
 	{
-		ID: "PATH_TRAVERSAL_JOIN", CWE: "CWE-22", Severity: "MEDIUM",
-		Title:   "File read on path join (check canonical realpath confinement)",
+		ID: "PATH_TRAVERSAL_JOIN", CWE: "CWE-22", Severity: "LOW", Confidence: "low",
+		Title:   "File read on dynamic path join (review canonical realpath confinement)",
 		Exts:    extSet(".go", ".py", ".js", ".ts", ".java", ".php", ".rs"),
-		Pattern: regexp.MustCompile(`(os\.ReadFile\s*\(\s*filepath\.Join|fs\.readFile(Sync)?\s*\(\s*path\.join|send_file\s*\(|FileInputStream\s*\([^)]*\+)`),
+		Pattern: regexp.MustCompile(`(os\.ReadFile\s*\(\s*filepath\.Join\s*\([^)]*,\s*[a-zA-Z_][a-zA-Z0-9_.]*|fs\.readFile(Sync)?\s*\(\s*path\.join\s*\([^)]*,\s*[a-zA-Z_][a-zA-Z0-9_.]*|send_file\s*\(\s*[a-zA-Z_][a-zA-Z0-9_.]*|FileInputStream\s*\([^)]*\+\s*[a-zA-Z_])`),
 	},
 	{
-		ID: "HARDCODED_SECRET", CWE: "CWE-798", Severity: "HIGH",
+		ID: "HARDCODED_SECRET", CWE: "CWE-798", Severity: "HIGH", Confidence: "high",
 		Title:   "Potential hardcoded private key or cloud/API credential",
 		Exts:    extSet(".go", ".py", ".js", ".ts", ".java", ".php", ".rs", ".yml", ".yaml", ".json", ".env", ".toml"),
 		Pattern: regexp.MustCompile(`(-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|ghp_[0-9A-Za-z]{36}|gho_[0-9A-Za-z]{36}|sk-[a-zA-Z0-9]{20,})`),
@@ -75,9 +81,12 @@ var sinkRules = []sinkRule{
 }
 
 var (
-	bolaParamRe       = regexp.MustCompile(`(?i)\{(id|[a-z_]*(id|uuid|slug|account|user|org|tenant|order|invoice|project|token))\}`)
-	ssrfParamNameRe   = regexp.MustCompile(`(?i)(url|uri|callback|webhook|redirect|next|dest|target|endpoint|host|proxy|fetch|import)`)
+	// Match genuine object identifiers ({id}, {user_id}, {userId}, {account}, etc.), never {android} or {valid}.
+	bolaParamRe = regexp.MustCompile(`\{(id|ID|uuid|UUID|slug|account|user|org|tenant|order|invoice|project|[a-zA-Z0-9]+_(id|ID|uuid|UUID|slug|key)|[a-z][a-z0-9]*(Id|Uuid|Slug))\}`)
+	// Match URL/redirect/callback parameter names specifically rather than generic 'host', 'next', or 'target'.
+	ssrfParamNameRe   = regexp.MustCompile(`(?i)^(url|uri|callback|callback_url|callback_uri|webhook|webhook_url|redirect|redirect_url|redirect_uri|return_url|next_url|dest_url|target_url|endpoint_url|proxy_url|fetch_url|import_url|feed_url|image_url|avatar_url|file_url)$`)
 	massAssignFieldRe = regexp.MustCompile(`(?i)^(role|roles|is_admin|isadmin|admin|permissions|scopes|verified|is_verified|balance|credits|plan|tier|owner_id|tenant_id|org_id)$`)
+	publicAuthPathRe  = regexp.MustCompile(`(?i)/(login|signin|sign-in|register|signup|sign-up|logout|oauth/token|auth/token|forgot-password|reset-password|health|healthz|ready|metrics)(/|$)`)
 	stateChangingVerb = map[string]bool{"post": true, "put": true, "patch": true, "delete": true}
 	skipDirs          = map[string]bool{".git": true, "node_modules": true, "target": true, "vendor": true, ".venv": true, "dist": true, "build": true}
 
@@ -87,7 +96,7 @@ var (
 	jsHeaderRe     = regexp.MustCompile(`["'` + "`" + `](X-[A-Za-z0-9\-]{3,40}|Authorization|X-Api-Key|Api-Key|X-CSRF-Token|X-Requested-With)["'` + "`" + `]`)
 	jsNextBuildRe  = regexp.MustCompile(`"buildId"\s*:\s*"([^"]{4,80})"`)
 	jsPkgVersionRe = regexp.MustCompile(`(?i)\b(next|react|react-dom|axios|lodash|jquery|express|angular|vue|svelte|graphql|apollo-client|jsonwebtoken|socket\.io)[/@":\s]+v?([0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.]+)?)`)
-	jsSecretRe     = regexp.MustCompile(`(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35}|ghp_[0-9A-Za-z]{36}|sk_live_[0-9A-Za-z]{16,}|eyJ[A-Za-z0-9_\-]{12,}\.eyJ[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)`)
+	jsSecretRe     = regexp.MustCompile(`(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{35}|ghp_[0-9A-Za-z]{36}|gho_[0-9A-Za-z]{36}|sk-[a-zA-Z0-9]{20,}|sk_live_[0-9A-Za-z]{16,}|eyJ[A-Za-z0-9_\-]{12,}\.eyJ[A-Za-z0-9_\-]{12,}\.[A-Za-z0-9_\-]{8,}|-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----)`)
 )
 
 func extSet(exts ...string) map[string]bool {
@@ -96,6 +105,20 @@ func extSet(exts ...string) map[string]bool {
 		m[e] = true
 	}
 	return m
+}
+
+func redactSecretToken(tok string) string {
+	if strings.HasPrefix(tok, "-----BEGIN ") {
+		return "[REDACTED PRIVATE KEY HEADER]"
+	}
+	if len(tok) <= 12 {
+		return "[REDACTED]"
+	}
+	return tok[:6] + "..." + tok[len(tok)-4:]
+}
+
+func redactSecretsInSnippet(s string) string {
+	return jsSecretRe.ReplaceAllStringFunc(s, redactSecretToken)
 }
 
 func resolveRef(doc map[string]any, ref string) any {
@@ -192,18 +215,18 @@ func auditOpenAPISpec(workspaceRoot, specPath string) (map[string]any, error) {
 			opID, _ := op["operationId"].(string)
 
 			opSecRaw, hasOpSec := op["security"]
-			isUnauth := false
+			undeclaredAuth := false
 			if hasOpSec {
 				if secSlice, ok := opSecRaw.([]any); ok && securityAllowsAnonymous(secSlice) {
-					isUnauth = true
+					undeclaredAuth = true
 				}
 			} else if !hasGlobalAuth {
-				isUnauth = true
+				undeclaredAuth = true
 			}
-			if isUnauth && stateChangingVerb[mLower] {
+			if undeclaredAuth && stateChangingVerb[mLower] && !publicAuthPathRe.MatchString(route) {
 				unauthWrites = append(unauthWrites, map[string]any{
 					"method": strings.ToUpper(mLower), "path": route, "operation_id": opID,
-					"cwe": "CWE-306", "risk": "State-changing operation allows unauthenticated requests",
+					"cwe": "CWE-306", "risk": "No OpenAPI security requirement declared on state-changing operation (verify server-side authentication)",
 				})
 			}
 
@@ -237,7 +260,7 @@ func auditOpenAPISpec(workspaceRoot, specPath string) (map[string]any, error) {
 					if schema, ok := pm["schema"]; ok {
 						collectSensitiveSchemaFields(doc, schema, seenRefs, &fields)
 					}
-				} else if ssrfParamNameRe.MatchString(pname) {
+				} else if ssrfParamNameRe.MatchString(strings.TrimSpace(pname)) {
 					ssrfParams = append(ssrfParams, map[string]any{
 						"method": strings.ToUpper(mLower), "path": route, "param": pname, "in": pin,
 						"cwe": "CWE-918",
@@ -258,6 +281,7 @@ func auditOpenAPISpec(workspaceRoot, specPath string) (map[string]any, error) {
 	}
 
 	return map[string]any{
+		"workspace_root":          workspaceRoot,
 		"spec_path":               resolvedPath,
 		"endpoints_audited":       endpointCount,
 		"global_security_defined": hasGlobalAuth,
@@ -341,9 +365,18 @@ func scanSourceSinks(workspaceRoot, targetPath string, maxFindings int) (map[str
 
 	var findings []map[string]any
 	filesScanned := 0
+	filesTruncated := false
+	findingsTruncated := false
+	skippedOversizedFiles := 0
+	longLinesSkipped := 0
 
 	scanFile := func(p string) {
-		if filesScanned >= maxScanFiles || len(findings) >= maxFindings {
+		if filesScanned >= maxScanFiles {
+			filesTruncated = true
+			return
+		}
+		if len(findings) >= maxFindings {
+			findingsTruncated = true
 			return
 		}
 		safePath, err := pathguard.ResolveConfined(workspaceRoot, p, true)
@@ -364,7 +397,11 @@ func scanSourceSinks(workspaceRoot, targetPath string, maxFindings int) (map[str
 			return
 		}
 		fi, err := os.Stat(safePath)
-		if err != nil || fi.Size() > maxFileSizeByte {
+		if err != nil {
+			return
+		}
+		if fi.Size() > maxFileSizeByte {
+			skippedOversizedFiles++
 			return
 		}
 		f, err := os.Open(safePath)
@@ -374,36 +411,52 @@ func scanSourceSinks(workspaceRoot, targetPath string, maxFindings int) (map[str
 		defer f.Close()
 		filesScanned++
 
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 64*1024), maxFileSizeByte)
+		br := bufio.NewReaderSize(f, 64*1024)
 		lineNo := 0
-		for sc.Scan() {
+		for {
+			line, readErr := br.ReadString('\n')
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				break
+			}
+			if line == "" && errors.Is(readErr, io.EOF) {
+				break
+			}
 			lineNo++
-			line := sc.Text()
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
+			if len(line) > maxLineBytes {
+				longLinesSkipped++
+				if errors.Is(readErr, io.EOF) {
+					break
+				}
 				continue
 			}
-			for _, rule := range active {
-				if rule.Pattern.MatchString(line) {
-					snip := trimmed
-					if len(snip) > 180 {
-						snip = snip[:180]
-					}
-					findings = append(findings, map[string]any{
-						"rule_id":             rule.ID,
-						"cwe":                 rule.CWE,
-						"severity":            rule.Severity,
-						"title":               rule.Title,
-						"file":                p,
-						"line":                lineNo,
-						"snippet":             snip,
-						"suggested_cve_query": fmt.Sprintf("cve-intel-mcp:list_cwe_writeups(cwe_id=%q)", rule.CWE),
-					})
-					if len(findings) >= maxFindings {
-						return
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" && !strings.HasPrefix(trimmed, "//") && !strings.HasPrefix(trimmed, "#") {
+				for _, rule := range active {
+					if rule.Pattern.MatchString(line) && (rule.Exclude == nil || !rule.Exclude.MatchString(line)) {
+						snip := redactSecretsInSnippet(trimmed)
+						if len(snip) > 180 {
+							snip = snip[:180]
+						}
+						findings = append(findings, map[string]any{
+							"rule_id":             rule.ID,
+							"cwe":                 rule.CWE,
+							"severity":            rule.Severity,
+							"confidence":          rule.Confidence,
+							"title":               rule.Title,
+							"file":                p,
+							"line":                lineNo,
+							"snippet":             snip,
+							"suggested_cve_query": fmt.Sprintf("cve-intel-mcp:list_cwe_writeups(cwe_id=%q)", rule.CWE),
+						})
+						if len(findings) >= maxFindings {
+							findingsTruncated = true
+							return
+						}
 					}
 				}
+			}
+			if errors.Is(readErr, io.EOF) {
+				break
 			}
 		}
 	}
@@ -421,7 +474,12 @@ func scanSourceSinks(workspaceRoot, targetPath string, maxFindings int) (map[str
 				}
 				return nil
 			}
-			if filesScanned >= maxScanFiles || len(findings) >= maxFindings {
+			if filesScanned >= maxScanFiles {
+				filesTruncated = true
+				return filepath.SkipAll
+			}
+			if len(findings) >= maxFindings {
+				findingsTruncated = true
 				return filepath.SkipAll
 			}
 			scanFile(p)
@@ -430,11 +488,16 @@ func scanSourceSinks(workspaceRoot, targetPath string, maxFindings int) (map[str
 	}
 
 	return map[string]any{
-		"target_path":   resolvedPath,
-		"files_scanned": filesScanned,
-		"finding_count": len(findings),
-		"truncated":     len(findings) >= maxFindings,
-		"findings":      findings,
+		"workspace_root":          workspaceRoot,
+		"target_path":             resolvedPath,
+		"files_scanned":           filesScanned,
+		"finding_count":           len(findings),
+		"truncated":               findingsTruncated || filesTruncated,
+		"findings_truncated":      findingsTruncated,
+		"files_truncated":         filesTruncated,
+		"skipped_oversized_files": skippedOversizedFiles,
+		"long_lines_skipped":      longLinesSkipped,
+		"findings":                findings,
 	}, nil
 }
 
@@ -481,30 +544,50 @@ func inspectJWTAndHeaders(jwtStr string, headers map[string]any) map[string]any 
 			hdrBytes, errH := base64.RawURLEncoding.DecodeString(parts[0])
 			payBytes, errP := base64.RawURLEncoding.DecodeString(parts[1])
 			var hdr, pay map[string]any
-			if errH == nil {
-				_ = json.Unmarshal(hdrBytes, &hdr)
+			hdrOK := errH == nil && json.Unmarshal(hdrBytes, &hdr) == nil && hdr != nil
+			payOK := errP == nil && json.Unmarshal(payBytes, &pay) == nil && pay != nil
+			jwtDecoded = map[string]any{
+				"header":          hdr,
+				"payload":         pay,
+				"header_decoded":  hdrOK,
+				"payload_decoded": payOK,
+				"signature_empty": parts[2] == "",
 			}
-			if errP == nil {
-				_ = json.Unmarshal(payBytes, &pay)
-			}
-			jwtDecoded = map[string]any{"header": hdr, "payload": pay, "signature_empty": parts[2] == ""}
 
-			alg := strings.ToLower(fmt.Sprintf("%v", hdr["alg"]))
-			if alg == "none" || alg == "" || alg == "<nil>" || parts[2] == "" {
-				issues = append(issues, map[string]any{"category": "jwt", "severity": "CRITICAL", "cwe": "CWE-347", "detail": "Unsigned JWT or alg=none detected"})
-			}
-			for _, riskHdr := range []string{"jku", "x5u", "jwk"} {
-				if _, ok := hdr[riskHdr]; ok {
-					issues = append(issues, map[string]any{"category": "jwt", "severity": "HIGH", "cwe": "CWE-347", "detail": fmt.Sprintf("JWT header contains %q (check for SSRF or untrusted key injection)", riskHdr)})
+			if !hdrOK {
+				issues = append(issues, map[string]any{
+					"category": "jwt",
+					"severity": "INFO",
+					"cwe":      "CWE-347",
+					"detail":   "Failed to decode JWT header (malformed base64url or JSON)",
+				})
+			} else {
+				algVal, hasAlg := hdr["alg"]
+				alg := ""
+				if s, ok := algVal.(string); ok {
+					alg = strings.ToLower(strings.TrimSpace(s))
+				}
+				if !hasAlg || alg == "" || alg == "none" || parts[2] == "" {
+					issues = append(issues, map[string]any{"category": "jwt", "severity": "CRITICAL", "cwe": "CWE-347", "detail": "Unsigned JWT or alg=none detected"})
+				}
+				for _, riskHdr := range []string{"jku", "x5u", "jwk"} {
+					if _, ok := hdr[riskHdr]; ok {
+						issues = append(issues, map[string]any{"category": "jwt", "severity": "HIGH", "cwe": "CWE-347", "detail": fmt.Sprintf("JWT header contains %q (check for SSRF or untrusted key injection)", riskHdr)})
+					}
+				}
+				if kid, ok := hdr["kid"].(string); ok && (strings.Contains(kid, "..") || strings.Contains(kid, "'") || strings.Contains(kid, "/")) {
+					issues = append(issues, map[string]any{"category": "jwt", "severity": "HIGH", "cwe": "CWE-22", "detail": "JWT kid header contains traversal or SQL metacharacters"})
 				}
 			}
-			if kid, ok := hdr["kid"].(string); ok && (strings.Contains(kid, "..") || strings.Contains(kid, "'") || strings.Contains(kid, "/")) {
-				issues = append(issues, map[string]any{"category": "jwt", "severity": "HIGH", "cwe": "CWE-22", "detail": "JWT kid header contains traversal or SQL metacharacters"})
-			}
-			if pay != nil {
-				if _, hasExp := pay["exp"]; !hasExp {
-					issues = append(issues, map[string]any{"category": "jwt", "severity": "MEDIUM", "cwe": "CWE-613", "detail": "JWT payload missing exp claim"})
-				}
+			if !payOK {
+				issues = append(issues, map[string]any{
+					"category": "jwt",
+					"severity": "INFO",
+					"cwe":      "CWE-347",
+					"detail":   "Failed to decode JWT payload (malformed base64url or JSON)",
+				})
+			} else if _, hasExp := pay["exp"]; !hasExp {
+				issues = append(issues, map[string]any{"category": "jwt", "severity": "MEDIUM", "cwe": "CWE-613", "detail": "JWT payload missing exp claim"})
 			}
 		}
 	}
@@ -597,9 +680,13 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 	buildIDs := map[string]bool{}
 	var secretHits []map[string]any
 	filesScanned := 0
+	filesTruncated := false
+	skippedOversized := 0
+	resultsTruncated := false
 
 	processFile := func(p string) {
 		if filesScanned >= maxFiles {
+			filesTruncated = true
 			return
 		}
 		safePath, err := pathguard.ResolveConfined(workspaceRoot, p, true)
@@ -607,7 +694,11 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 			return
 		}
 		st, err := os.Stat(safePath)
-		if err != nil || st.IsDir() || st.Size() > 8<<20 {
+		if err != nil || st.IsDir() {
+			return
+		}
+		if st.Size() > 8<<20 {
+			skippedOversized++
 			return
 		}
 		raw, err := os.ReadFile(safePath)
@@ -620,21 +711,31 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 		for _, m := range jsAPIPathRe.FindAllStringSubmatch(text, 200) {
 			if len(apiPaths) < 300 {
 				apiPaths[m[1]] = true
+			} else {
+				resultsTruncated = true
 			}
 		}
 		for _, u := range jsAbsURLRe.FindAllString(text, 200) {
-			if len(absURLs) < 200 && !isNoisyURL(u) {
-				absURLs[u] = true
+			if !isNoisyURL(u) {
+				if len(absURLs) < 200 {
+					absURLs[u] = true
+				} else {
+					resultsTruncated = true
+				}
 			}
 		}
 		for _, m := range jsGraphQLOpRe.FindAllStringSubmatch(text, 100) {
 			if len(gqlOps) < 100 {
 				gqlOps[strings.ToLower(m[1])+" "+m[2]] = true
+			} else {
+				resultsTruncated = true
 			}
 		}
 		for _, m := range jsHeaderRe.FindAllStringSubmatch(text, 100) {
 			if len(headers) < 80 {
 				headers[m[1]] = true
+			} else {
+				resultsTruncated = true
 			}
 		}
 		for _, m := range jsNextBuildRe.FindAllStringSubmatch(text, 10) {
@@ -643,23 +744,20 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 		for _, m := range jsPkgVersionRe.FindAllStringSubmatch(text, 50) {
 			if len(pkgVersions) < 80 {
 				pkgVersions[strings.ToLower(m[1])+"@"+m[2]] = true
+			} else {
+				resultsTruncated = true
 			}
 		}
-		if len(secretHits) < 50 {
-			for _, m := range jsSecretRe.FindAllString(text, 10) {
-				redacted := m
-				if len(redacted) > 24 {
-					redacted = redacted[:12] + "..." + redacted[len(redacted)-6:]
-				}
-				secretHits = append(secretHits, map[string]any{
-					"file":    p,
-					"preview": redacted,
-					"cwe":     "CWE-798",
-				})
-				if len(secretHits) >= 50 {
-					break
-				}
+		for _, m := range jsSecretRe.FindAllString(text, 10) {
+			if len(secretHits) >= 50 {
+				resultsTruncated = true
+				break
 			}
+			secretHits = append(secretHits, map[string]any{
+				"file":    p,
+				"preview": redactSecretToken(m),
+				"cwe":     "CWE-798",
+			})
 		}
 	}
 
@@ -677,6 +775,7 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 				return nil
 			}
 			if filesScanned >= maxFiles {
+				filesTruncated = true
 				return fs.SkipAll
 			}
 			if !jsExts[strings.ToLower(filepath.Ext(p))] {
@@ -704,15 +803,19 @@ func extractJSEndpoints(workspaceRoot, targetPath string, maxFiles int) (map[str
 	buildList := toSorted(buildIDs)
 
 	return map[string]any{
-		"target_path":       resolvedPath,
-		"files_scanned":     filesScanned,
-		"api_paths":         pathsList,
-		"absolute_urls":     urlsList,
-		"graphql_ops":       gqlList,
-		"custom_headers":    hdrList,
-		"package_versions":  pkgList,
-		"next_build_ids":    buildList,
-		"secret_candidates": secretHits,
+		"workspace_root":          workspaceRoot,
+		"target_path":             resolvedPath,
+		"files_scanned":           filesScanned,
+		"files_truncated":         filesTruncated,
+		"results_truncated":       resultsTruncated,
+		"skipped_oversized_files": skippedOversized,
+		"api_paths":               pathsList,
+		"absolute_urls":           urlsList,
+		"graphql_ops":             gqlList,
+		"custom_headers":          hdrList,
+		"package_versions":        pkgList,
+		"next_build_ids":          buildList,
+		"secret_candidates":       secretHits,
 		"summary": map[string]int{
 			"api_paths":         len(pathsList),
 			"absolute_urls":     len(urlsList),
@@ -729,7 +832,7 @@ func buildServer(workspaceRoot string) *mcpserver.Server {
 
 	srv.Register(mcpserver.Tool{
 		Name:        "audit_openapi_spec",
-		Description: "Audit an OpenAPI 3.x / Swagger 2.0 spec inside the configured workspace root for unauthenticated writes (CWE-306), object ID paths (CWE-639), SSRF params (CWE-918), and mass-assignment fields (CWE-915).",
+		Description: "Audit an OpenAPI 3.x / Swagger 2.0 spec inside the configured workspace root for undeclared auth on writes (CWE-306), object ID paths (CWE-639), SSRF params (CWE-918), and mass-assignment fields (CWE-915).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -812,7 +915,13 @@ func main() {
 	workspaceDir := flag.String("workspace-dir", mcpserver.EnvOr("ATTACK_SURFACE_ROOT", "."), "Confined root directory for file-reading tools")
 	flag.Parse()
 
-	srv := buildServer(*workspaceDir)
+	absRoot, err := filepath.Abs(*workspaceDir)
+	if err != nil {
+		absRoot = *workspaceDir
+	}
+	fmt.Fprintf(os.Stderr, "[*] attack-surface-mcp workspace root: %s\n", absRoot)
+
+	srv := buildServer(absRoot)
 	if err := srv.Run(*transport, *host, *port); err != nil {
 		fmt.Fprintf(os.Stderr, "attack-surface-mcp error: %v\n", err)
 		os.Exit(1)

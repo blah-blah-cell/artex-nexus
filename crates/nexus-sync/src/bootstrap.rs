@@ -14,6 +14,8 @@ pub struct BootstrapConfig {
     pub password: String,
     pub setup_token: Option<String>,
     pub mcp_host: String,
+    pub mcp_auth_token: Option<String>,
+    pub allow_insecure_http: bool,
     pub docker_network: bool,
     pub knowledge_dir: String,
     pub data_dir: String,
@@ -30,13 +32,36 @@ pub struct BootstrapConfig {
     pub dry_run: bool,
 }
 
+fn is_loopback_artex_url(raw_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(raw_url) else {
+        return false;
+    };
+    matches!(
+        parsed
+            .host_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
+}
+
 fn mcp_endpoints(cfg: &BootstrapConfig) -> Vec<(&'static str, String)> {
     if cfg.docker_network {
         vec![
             ("cve-intel-mcp", "http://cve-intel-mcp:8901/mcp".to_string()),
-            ("patch-diff-mcp", "http://patch-diff-mcp:8902/mcp".to_string()),
-            ("scope-guard-mcp", "http://scope-guard-mcp:8903/mcp".to_string()),
-            ("attack-surface-mcp", "http://attack-surface-mcp:8904/mcp".to_string()),
+            (
+                "patch-diff-mcp",
+                "http://patch-diff-mcp:8902/mcp".to_string(),
+            ),
+            (
+                "scope-guard-mcp",
+                "http://scope-guard-mcp:8903/mcp".to_string(),
+            ),
+            (
+                "attack-surface-mcp",
+                "http://attack-surface-mcp:8904/mcp".to_string(),
+            ),
         ]
     } else {
         let h = cfg.mcp_host.trim();
@@ -160,7 +185,9 @@ fn api_call(
     body: Option<Value>,
 ) -> Result<(u16, Value)> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
-    let mut req = client.request(method, &url).header("Origin", base.trim_end_matches('/'));
+    let mut req = client
+        .request(method, &url)
+        .header("Origin", base.trim_end_matches('/'));
     if let Some(tok) = token {
         req = req.header("Authorization", format!("Bearer {tok}"));
     }
@@ -197,6 +224,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             "dry_run": true,
             "artex_url": cfg.artex_url,
             "mcps": endpoints,
+            "mcp_auth_configured": cfg.mcp_auth_token.as_ref().is_some_and(|t| !t.is_empty()),
             "skills": all_skills,
             "roles_updated": ["goals", "planner", "mainagent", "worker", "auto", "pentest", "reporter", "retester"],
             "planner_profile_id": cfg.planner_profile_id,
@@ -204,10 +232,17 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
         }));
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
     let base = cfg.artex_url.trim_end_matches('/');
+    if base.starts_with("http://") && !is_loopback_artex_url(base) {
+        if !cfg.allow_insecure_http {
+            bail!(
+                "refusing to send ARTEX credentials over plain http:// to non-loopback host '{base}' (use https:// or pass --allow-insecure-http)"
+            );
+        }
+        eprintln!("[!] WARNING: sending ARTEX credentials over unencrypted http:// to {base}");
+    }
+
+    let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
     // 1. Optional first-boot init if setup_token is provided
     if let Some(stoken) = &cfg.setup_token {
@@ -258,8 +293,14 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
     }
 
     // 3. Register & refresh all 4 artex-nexus HTTP MCPs
-    let (mcp_st, existing_mcps_val) =
-        api_call(&client, base, reqwest::Method::GET, "/api/mcp", Some(&token), None)?;
+    let (mcp_st, existing_mcps_val) = api_call(
+        &client,
+        base,
+        reqwest::Method::GET,
+        "/api/mcp",
+        Some(&token),
+        None,
+    )?;
     if mcp_st != 200 {
         bail!("failed to list ARTEX MCP servers (HTTP {mcp_st}): {existing_mcps_val}");
     }
@@ -270,14 +311,49 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
         .unwrap_or_default();
     let mut mcp_ids: HashMap<String, i64> = HashMap::new();
     for m in &existing_list {
-        if let (Some(name), Some(id)) = (m.get("name").and_then(|v| v.as_str()), m.get("id").and_then(|v| v.as_i64())) {
+        if let (Some(name), Some(id)) = (
+            m.get("name").and_then(|v| v.as_str()),
+            m.get("id").and_then(|v| v.as_i64()),
+        ) {
             mcp_ids.insert(name.to_string(), id);
         }
     }
 
+    let mcp_headers = match cfg
+        .mcp_auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(tok) => json!({"Authorization": format!("Bearer {tok}")}),
+        None => json!({}),
+    };
+
     let mut mcp_summary = serde_json::Map::new();
     for (name, url) in &endpoints {
         let id = if let Some(&existing_id) = mcp_ids.get(*name) {
+            if !mcp_headers.as_object().is_none_or(|m| m.is_empty()) {
+                let (ust, uval) = api_call(
+                    &client,
+                    base,
+                    reqwest::Method::PUT,
+                    &format!("/api/mcp/{existing_id}"),
+                    Some(&token),
+                    Some(json!({
+                        "name": name,
+                        "transport": "http",
+                        "url": url,
+                        "headers": mcp_headers,
+                        "args": [],
+                        "env": {},
+                        "enabled": true,
+                        "timeout_seconds": 60
+                    })),
+                )?;
+                if ust != 200 {
+                    bail!("failed to update MCP {name} auth headers (HTTP {ust}): {uval}");
+                }
+            }
             existing_id
         } else {
             let (st, created) = api_call(
@@ -290,6 +366,7 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
                     "name": name,
                     "transport": "http",
                     "url": url,
+                    "headers": mcp_headers,
                     "args": [],
                     "env": {},
                     "enabled": true,
@@ -320,13 +397,21 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
-        mcp_summary.insert((*name).to_string(), json!({"id": id, "refresh_status": rst, "tools": tool_cnt}));
+        mcp_summary.insert(
+            (*name).to_string(),
+            json!({"id": id, "refresh_status": rst, "tools": tool_cnt}),
+        );
     }
 
-    let all_nexus_ids: Vec<i64> = ["cve-intel-mcp", "patch-diff-mcp", "scope-guard-mcp", "attack-surface-mcp"]
-        .iter()
-        .filter_map(|k| mcp_ids.get(*k).copied())
-        .collect();
+    let all_nexus_ids: Vec<i64> = [
+        "cve-intel-mcp",
+        "patch-diff-mcp",
+        "scope-guard-mcp",
+        "attack-surface-mcp",
+    ]
+    .iter()
+    .filter_map(|k| mcp_ids.get(*k).copied())
+    .collect();
     let reporter_ids: Vec<i64> = ["cve-intel-mcp", "scope-guard-mcp"]
         .iter()
         .filter_map(|k| mcp_ids.get(*k).copied())
@@ -372,7 +457,16 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
         }
     }
 
-    for role in ["goals", "planner", "mainagent", "worker", "auto", "pentest", "reporter", "retester"] {
+    for role in [
+        "goals",
+        "planner",
+        "mainagent",
+        "worker",
+        "auto",
+        "pentest",
+        "reporter",
+        "retester",
+    ] {
         let mut patch = serde_json::Map::new();
         match role {
             "planner" | "mainagent" => {
@@ -410,7 +504,15 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
 
     // 6. Inject ARTEX-Nexus context into all 7 operational prompts (preserving upstream templates)
     let mut prompt_versions = serde_json::Map::new();
-    for role in ["planner", "worker", "mainagent", "auto", "pentest", "reporter", "retester"] {
+    for role in [
+        "planner",
+        "worker",
+        "mainagent",
+        "auto",
+        "pentest",
+        "reporter",
+        "retester",
+    ] {
         if let Some(block) = build_role_context(role, cfg) {
             let (gst, agent_val) = api_call(
                 &client,
@@ -423,7 +525,10 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
             if gst != 200 {
                 bail!("failed to load agent {role} prompt (HTTP {gst}): {agent_val}");
             }
-            let cur = agent_val.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let cur = agent_val
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let merged = merge_prompt(cur, &block);
             let (pst, pval) = api_call(
                 &client,
@@ -452,8 +557,14 @@ pub fn cmd_bootstrap(cfg: &BootstrapConfig) -> Result<Value> {
         let hname = hname.trim();
         let hval = hval.trim();
         let rule_name = format!("Nexus-Header-{hname}");
-        let (rw_st, rw_val) =
-            api_call(&client, base, reqwest::Method::GET, "/api/traffic/rewrite-rules", Some(&token), None)?;
+        let (rw_st, rw_val) = api_call(
+            &client,
+            base,
+            reqwest::Method::GET,
+            "/api/traffic/rewrite-rules",
+            Some(&token),
+            None,
+        )?;
         if rw_st != 200 {
             bail!("failed to list traffic rewrite rules (HTTP {rw_st}): {rw_val}");
         }

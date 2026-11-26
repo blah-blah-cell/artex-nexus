@@ -68,6 +68,6 @@ finally {
     $NexusPageDir = Join-Path $WebDir "src\app\(main)\nexus"
     if (Test-Path $NexusPageDir) { Remove-Item -Recurse -Force $NexusPageDir }
     if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
-    git -C $ArtexDir checkout -- server/webui/dist 2>$null | Out-Null
+    $global:LASTEXITCODE = 0
     $ErrorActionPreference = $prevEap
 }

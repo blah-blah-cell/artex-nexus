@@ -1,10 +1,12 @@
-use crate::version::is_version_affected;
-use crate::{detect_schema_version, open_readonly, sanitize_fts_query};
+use crate::version::{ParsedVersion, is_version_affected};
+use crate::{
+    detect_schema_version, escape_like, normalize_pypi_name, open_readonly, sanitize_fts_query,
+};
 use anyhow::Result;
 use rusqlite::{Connection, params, params_from_iter};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -55,7 +57,7 @@ impl CachedDb {
         let stale = self.conn.is_none() || self.stamp != cur_stamp;
         if stale {
             let conn = open_readonly(&self.path)?;
-            let schema = detect_schema_version(&conn);
+            let schema = detect_schema_version(&conn)?;
             self.conn = Some(conn);
             self.schema = schema;
             self.stamp = cur_stamp;
@@ -88,6 +90,16 @@ pub fn norm_cwe(raw: &str) -> String {
     }
 }
 
+/// Splits DB `fixed_ver` column where `<=x` encodes OSV `last_affected` (no fixed version).
+pub fn split_fix_or_last_affected(raw_fixed: &str) -> (&str, &str) {
+    let trimmed = raw_fixed.trim();
+    if let Some(la) = trimmed.strip_prefix("<=") {
+        ("", la.trim())
+    } else {
+        (trimmed, "")
+    }
+}
+
 pub fn cwes_for_cve(conn: &Connection, schema: u32, cve_id: &str) -> Result<Vec<String>> {
     if schema >= 2 {
         let mut stmt =
@@ -97,9 +109,11 @@ pub fn cwes_for_cve(conn: &Connection, schema: u32, cve_id: &str) -> Result<Vec<
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     } else {
-        match conn.query_row("SELECT cwe_ids FROM cves WHERE cve_id = ?1", [cve_id], |r| {
-            r.get::<_, String>(0)
-        }) {
+        match conn.query_row(
+            "SELECT cwe_ids FROM cves WHERE cve_id = ?1",
+            [cve_id],
+            |r| r.get::<_, String>(0),
+        ) {
             Ok(raw) => Ok(raw
                 .split(',')
                 .map(str::trim)
@@ -122,18 +136,30 @@ pub struct SearchCveOpts<'a> {
     pub limit: i64,
 }
 
-pub fn query_search_cves(conn: &Connection, schema: u32, opts: &SearchCveOpts<'_>) -> Result<Value> {
+pub fn query_search_cves(
+    conn: &Connection,
+    schema: u32,
+    opts: &SearchCveOpts<'_>,
+) -> Result<Value> {
     let start = Instant::now();
     let fts_q = sanitize_fts_query(opts.query);
     if fts_q.is_empty() {
         return Ok(json!({"error": "Provide a non-empty search query."}));
     }
-    let min_cvss = opts.min_cvss.max(4.0);
+    let min_cvss = opts.min_cvss.clamp(0.0, 10.0);
     let limit = opts.limit.clamp(1, 100);
     let maturity_col = if schema >= 2 {
         "c.exploit_maturity"
     } else {
         "CASE WHEN c.is_kev = 1 THEN 'KEV_EXPLOITED' ELSE 'NONE' END"
+    };
+
+    // Unscored KEV entries are included when min_cvss <= 4.0 or kev_only is set;
+    // scored entries must always meet min_cvss.
+    let cvss_predicate = if min_cvss <= 4.0 || opts.kev_only {
+        "(c.cvss_score >= ? OR (c.cvss_score IS NULL AND c.is_kev = 1))"
+    } else {
+        "c.cvss_score >= ?"
     };
 
     let mut sql = format!(
@@ -144,7 +170,7 @@ pub fn query_search_cves(conn: &Connection, schema: u32, opts: &SearchCveOpts<'_
          FROM cves_fts f
          JOIN cves c ON c.rowid = f.rowid
          WHERE cves_fts MATCH ?
-           AND (c.cvss_score >= ? OR c.is_kev = 1)"
+           AND {cvss_predicate}"
     );
     let mut sql_params: Vec<rusqlite::types::Value> = vec![fts_q.into(), min_cvss.into()];
 
@@ -154,11 +180,13 @@ pub fn query_search_cves(conn: &Connection, schema: u32, opts: &SearchCveOpts<'_
     }
     if let Some(ref cwe_id) = opts.cwe {
         if schema >= 2 {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM cve_cwes cc WHERE cc.cve_id = c.cve_id AND cc.cwe_id = ?)");
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM cve_cwes cc WHERE cc.cve_id = c.cve_id AND cc.cwe_id = ?)",
+            );
             sql_params.push(cwe_id.clone().into());
         } else {
-            sql.push_str(" AND (',' || UPPER(c.cwe_ids) || ',') LIKE ?");
-            sql_params.push(format!("%,{cwe_id},%").into());
+            sql.push_str(r" AND (',' || UPPER(c.cwe_ids) || ',') LIKE ? ESCAPE '\'");
+            sql_params.push(format!("%,{},%", escape_like(cwe_id)).into());
         }
     }
     if opts.kev_only {
@@ -169,7 +197,7 @@ pub fn query_search_cves(conn: &Connection, schema: u32, opts: &SearchCveOpts<'_
     }
 
     sql.push_str(
-        " ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC, COALESCE(c.epss_score, 0.0) DESC
+        " ORDER BY bm25(cves_fts) ASC, c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC, COALESCE(c.epss_score, 0.0) DESC
           LIMIT ?",
     );
     sql_params.push(limit.into());
@@ -231,7 +259,7 @@ pub fn query_search_writeups(
          JOIN writeups w ON w.id = wf.rowid
          JOIN cves c ON c.cve_id = w.cve_id
          WHERE writeups_fts MATCH ?1 {patch_clause}
-         ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC, w.has_patch_diff DESC
+         ORDER BY bm25(writeups_fts) ASC, c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC, w.has_patch_diff DESC
          LIMIT ?2"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -337,11 +365,14 @@ pub fn query_cve_details(conn: &Connection, schema: u32, raw_cve_id: &str) -> Re
         )?;
         let pkgs: Vec<Value> = pkg_stmt
             .query_map([&cid], |r| {
+                let raw_fixed: String = r.get(3)?;
+                let (fixed_ver, last_affected) = split_fix_or_last_affected(&raw_fixed);
                 Ok(json!({
                     "ecosystem": r.get::<_, String>(0)?,
                     "package_name": r.get::<_, String>(1)?,
                     "introduced_ver": r.get::<_, String>(2)?,
-                    "fixed_ver": r.get::<_, String>(3)?,
+                    "fixed_ver": fixed_ver,
+                    "last_affected": last_affected,
                     "advisory_id": r.get::<_, String>(4)?
                 }))
             })?
@@ -352,12 +383,37 @@ pub fn query_cve_details(conn: &Connection, schema: u32, raw_cve_id: &str) -> Re
     Ok(record)
 }
 
-pub fn query_package_vulns(
+#[derive(Debug, Default)]
+pub struct PackageCheckReport {
+    pub vulnerabilities: Vec<Value>,
+    pub unverifiable_ranges: usize,
+    pub installed_unparseable: bool,
+}
+
+pub fn query_package_vulns_detailed(
     conn: &Connection,
     ecosystem: &str,
     package_name: &str,
     version: &str,
-) -> Result<Vec<Value>> {
+) -> Result<PackageCheckReport> {
+    let installed_unparseable = ParsedVersion::parse(version).is_none();
+
+    let mut lookup_names = vec![package_name.trim().to_string()];
+    if ecosystem.eq_ignore_ascii_case("PyPI") {
+        let pep503 = normalize_pypi_name(package_name);
+        if !pep503.is_empty() && !lookup_names.iter().any(|n| n.eq_ignore_ascii_case(&pep503)) {
+            lookup_names.push(pep503);
+        }
+        let underscored = package_name.trim().replace('-', "_");
+        if !underscored.is_empty()
+            && !lookup_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&underscored))
+        {
+            lookup_names.push(underscored);
+        }
+    }
+
     let mut stmt = conn.prepare_cached(
         "SELECT p.cve_id, p.ecosystem, p.package_name, p.introduced_ver, p.fixed_ver, p.advisory_id,
                 c.cvss_score, c.cvss_severity, c.is_kev, c.epss_score, c.exploit_maturity, c.title
@@ -366,44 +422,70 @@ pub fn query_package_vulns(
          WHERE p.package_name = ?1 COLLATE NOCASE AND p.ecosystem = ?2 COLLATE NOCASE
          ORDER BY c.is_kev DESC, COALESCE(c.cvss_score, 8.0) DESC",
     )?;
-    let mut findings = Vec::new();
-    let rows = stmt.query_map(params![package_name, ecosystem], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, String>(5)?,
-            r.get::<_, Option<f64>>(6)?,
-            r.get::<_, String>(7)?,
-            r.get::<_, i64>(8)? == 1,
-            r.get::<_, Option<f64>>(9)?,
-            r.get::<_, String>(10)?,
-            r.get::<_, String>(11)?,
-        ))
-    })?;
-    for row in rows {
-        let (cve_id, eco, pkg, intro, fixed, adv, score, sev, is_kev, epss, mat, title) = row?;
-        if is_version_affected(version, &intro, &fixed) == Some(true) {
-            findings.push(json!({
-                "cve_id": cve_id,
-                "advisory_id": adv,
-                "ecosystem": eco,
-                "package_name": pkg,
-                "installed_version": version,
-                "introduced_ver": intro,
-                "fixed_ver": fixed,
-                "cvss_score": score,
-                "cvss_severity": sev,
-                "is_kev": is_kev,
-                "epss_score": epss,
-                "exploit_maturity": mat,
-                "title": title
-            }));
+
+    let mut report = PackageCheckReport {
+        vulnerabilities: Vec::new(),
+        unverifiable_ranges: 0,
+        installed_unparseable,
+    };
+    let mut seen_ranges: HashSet<(String, String, String, String)> = HashSet::new();
+
+    for lookup in &lookup_names {
+        let rows = stmt.query_map(params![lookup, ecosystem], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<f64>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, i64>(8)? == 1,
+                r.get::<_, Option<f64>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, String>(11)?,
+            ))
+        })?;
+        for row in rows {
+            let (cve_id, eco, pkg, intro, raw_fixed, adv, score, sev, is_kev, epss, mat, title) =
+                row?;
+            if !seen_ranges.insert((
+                cve_id.clone(),
+                adv.clone(),
+                intro.clone(),
+                raw_fixed.clone(),
+            )) {
+                continue;
+            }
+            match is_version_affected(version, &intro, &raw_fixed) {
+                Some(true) => {
+                    let (fixed_ver, last_affected) = split_fix_or_last_affected(&raw_fixed);
+                    report.vulnerabilities.push(json!({
+                        "cve_id": cve_id,
+                        "advisory_id": adv,
+                        "ecosystem": eco,
+                        "package_name": pkg,
+                        "installed_version": version,
+                        "introduced_ver": intro,
+                        "fixed_ver": fixed_ver,
+                        "last_affected": last_affected,
+                        "cvss_score": score,
+                        "cvss_severity": sev,
+                        "is_kev": is_kev,
+                        "epss_score": epss,
+                        "exploit_maturity": mat,
+                        "title": title
+                    }));
+                }
+                Some(false) => {}
+                None => {
+                    report.unverifiable_ranges += 1;
+                }
+            }
         }
     }
-    Ok(findings)
+    Ok(report)
 }
 
 pub fn query_kb_stats(conn: &Connection, schema: u32) -> Result<Value> {
@@ -413,16 +495,47 @@ pub fn query_kb_stats(conn: &Connection, schema: u32) -> Result<Value> {
         let (k, v) = row?;
         meta.insert(k, json!(v));
     }
+
+    // Backfill core counters if the DB was created without precomputed metadata keys.
+    if !meta.contains_key("total_cves") {
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM cves", [], |r| r.get(0))?;
+        meta.insert("total_cves".to_string(), json!(cnt.to_string()));
+    }
+    if !meta.contains_key("kev_count") {
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM cves WHERE is_kev = 1", [], |r| {
+            r.get(0)
+        })?;
+        meta.insert("kev_count".to_string(), json!(cnt.to_string()));
+    }
+    if !meta.contains_key("total_writeups") {
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM writeups", [], |r| r.get(0))?;
+        meta.insert("total_writeups".to_string(), json!(cnt.to_string()));
+    }
+    if schema >= 2 && !meta.contains_key("writeups_with_text") {
+        let cnt: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM writeups WHERE length(content_excerpt) > 0",
+            [],
+            |r| r.get(0),
+        )?;
+        meta.insert("writeups_with_text".to_string(), json!(cnt.to_string()));
+    }
+    if schema >= 2 && !meta.contains_key("total_packages") {
+        let cnt: i64 = conn.query_row("SELECT COUNT(*) FROM cve_packages", [], |r| r.get(0))?;
+        meta.insert("total_packages".to_string(), json!(cnt.to_string()));
+    }
+
     let mut by_sev = serde_json::Map::new();
-    let mut sev_stmt = conn.prepare_cached("SELECT cvss_severity, COUNT(*) FROM cves GROUP BY cvss_severity")?;
+    let mut sev_stmt =
+        conn.prepare_cached("SELECT cvss_severity, COUNT(*) FROM cves GROUP BY cvss_severity")?;
     for row in sev_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
         let (k, v) = row?;
         by_sev.insert(k, json!(v));
     }
     let mut by_maturity = serde_json::Map::new();
     if schema >= 2 {
-        let mut mat_stmt =
-            conn.prepare_cached("SELECT exploit_maturity, COUNT(*) FROM cves GROUP BY exploit_maturity")?;
+        let mut mat_stmt = conn.prepare_cached(
+            "SELECT exploit_maturity, COUNT(*) FROM cves GROUP BY exploit_maturity",
+        )?;
         for row in mat_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
             let (k, v) = row?;
             by_maturity.insert(k, json!(v));

@@ -1,15 +1,84 @@
 use crate::ingest::{SYNC_USER_AGENT, http_client};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use nexus_common::atomic_replace;
+use reqwest::blocking::Client;
 use reqwest::header::{ETAG, IF_NONE_MATCH, USER_AGENT};
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const MAX_DECOMPRESSED_DB_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB safety ceiling
+
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn is_valid_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+pub fn validate_repo_and_tag(repo: &str, tag: &str) -> Result<()> {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        bail!("invalid --repo '{repo}': expected '<owner>/<repo>'");
+    };
+    if !is_valid_segment(owner) || !is_valid_segment(name) {
+        bail!("invalid --repo '{repo}': disallowed characters in owner or repo name");
+    }
+    if !is_valid_segment(tag) {
+        bail!("invalid --tag '{tag}': disallowed characters");
+    }
+    Ok(())
+}
+
+fn download_client() -> Result<Client> {
+    // Streaming download client: short connect timeout, TCP keepalive, and generous overall cap
+    // so multi-hundred-MB downloads do not fail at 120s on slower links.
+    Ok(Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30))
+        .timeout(Duration::from_secs(1800))
+        .user_agent(SYNC_USER_AGENT)
+        .build()?)
+}
+
+fn copy_capped<R: Read, W: Write>(reader: &mut R, writer: &mut W, cap: u64) -> Result<u64> {
+    let mut limited = reader.take(cap + 1);
+    let copied = io::copy(&mut limited, writer)?;
+    if copied > cap {
+        bail!("decompressed database exceeded {cap} byte safety cap");
+    }
+    Ok(copied)
+}
 
 pub fn cmd_fetch(
     repo: &str,
@@ -17,15 +86,28 @@ pub fn cmd_fetch(
     out: &Path,
     force: bool,
     allow_unverified: bool,
+    pinned_sha256: Option<&str>,
 ) -> Result<()> {
+    validate_repo_and_tag(repo, tag)?;
+    let pinned_sha = pinned_sha256
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    if let Some(ref p) = pinned_sha
+        && (p.len() != 64 || !p.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        bail!("--expected-sha256 must be a 64-character hex SHA-256 digest");
+    }
+
     let start = Instant::now();
-    let client = http_client()?;
+    let api_client = http_client()?;
+    let dl_client = download_client()?;
     let cache_dir = out.parent().unwrap_or(Path::new("data")).join(".cache");
     fs::create_dir_all(&cache_dir)?;
     let etag_file = cache_dir.join("release.etag");
+    let sha_cache_file = cache_dir.join("release.sha256");
 
     let api_url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
-    let mut req = client.get(&api_url).header(USER_AGENT, SYNC_USER_AGENT);
+    let mut req = api_client.get(&api_url).header(USER_AGENT, SYNC_USER_AGENT);
     if !force && out.exists() && etag_file.exists() {
         let etag = fs::read_to_string(&etag_file)?.trim().to_string();
         if !etag.is_empty() {
@@ -67,17 +149,17 @@ pub fn cmd_fetch(
         }
     }
 
-    let (asset_name, dl_url) =
-        asset_url.ok_or_else(|| anyhow::anyhow!("No CVE DB archive asset found in {repo}@{tag}"))?;
+    let (asset_name, dl_url) = asset_url
+        .ok_or_else(|| anyhow::anyhow!("No CVE DB archive asset found in {repo}@{tag}"))?;
 
-    let expected_sha = if let Some(s_url) = sums_url {
-        let text = client.get(&s_url).send()?.error_for_status()?.text()?;
+    let release_sha = if let Some(s_url) = sums_url {
+        let text = api_client.get(&s_url).send()?.error_for_status()?.text()?;
         text.lines().find_map(|line| {
             let mut parts = line.split_whitespace();
             let h = parts.next()?;
             let n = parts.next()?;
             if n == asset_name {
-                Some(h.to_lowercase())
+                Some(h.to_ascii_lowercase())
             } else {
                 None
             }
@@ -86,15 +168,36 @@ pub fn cmd_fetch(
         None
     };
 
+    let expected_sha = pinned_sha.or(release_sha);
     if expected_sha.is_none() && !allow_unverified {
-        anyhow::bail!(
-            "SHA256SUMS.txt missing or has no entry for {asset_name} in {repo}@{tag} (pass --allow-unverified to override)"
+        bail!(
+            "SHA256SUMS.txt missing or has no entry for {asset_name} in {repo}@{tag} (pass --expected-sha256 or --allow-unverified)"
         );
     }
 
+    // Even if GitHub rotated the release-JSON ETag, skip re-downloading when SHA matches installed DB.
+    if !force
+        && out.exists()
+        && let Some(ref exp) = expected_sha
+        && let Ok(cached_sha) = fs::read_to_string(&sha_cache_file)
+        && cached_sha.trim().eq_ignore_ascii_case(exp)
+    {
+        if let Some(et) = new_etag {
+            let _ = fs::write(&etag_file, et);
+        }
+        eprintln!(
+            "[+] Local DB already matches asset SHA-256 ({}...) in {}ms: {}",
+            &exp[..16],
+            start.elapsed().as_millis(),
+            out.display()
+        );
+        return Ok(());
+    }
+
     let archive_path = cache_dir.join(&asset_name);
+    let _archive_guard = TempFileGuard::new(archive_path.clone());
     let dl_start = Instant::now();
-    let mut dl_resp = client.get(&dl_url).send()?.error_for_status()?;
+    let mut dl_resp = dl_client.get(&dl_url).send()?.error_for_status()?;
     let mut out_file = BufWriter::new(File::create(&archive_path)?);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 256 * 1024];
@@ -109,6 +212,7 @@ pub fn cmd_fetch(
         total_bytes += n as u64;
     }
     out_file.flush()?;
+    drop(out_file);
     let actual_sha = hex::encode(hasher.finalize());
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
     let mbps = mb / dl_start.elapsed().as_secs_f64().max(0.001);
@@ -117,24 +221,30 @@ pub fn cmd_fetch(
         &actual_sha[..16]
     );
 
-    if let Some(exp) = expected_sha
-        && exp != actual_sha
+    if let Some(ref exp) = expected_sha
+        && *exp != actual_sha
     {
-        fs::remove_file(&archive_path).ok();
-        anyhow::bail!("SHA-256 verification failed: expected {exp}, got {actual_sha}");
+        bail!("SHA-256 verification failed: expected {exp}, got {actual_sha}");
+    }
+
+    if let Some(parent) = out.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     let tmp_db = out.with_extension("sqlite.tmp");
+    let mut tmp_guard = TempFileGuard::new(tmp_db.clone());
     let dec_start = Instant::now();
     {
         let src = BufReader::new(File::open(&archive_path)?);
         let mut dst = BufWriter::new(File::create(&tmp_db)?);
         if asset_name.ends_with(".zst") {
             let mut decoder = zstd::stream::Decoder::new(src)?;
-            io::copy(&mut decoder, &mut dst)?;
+            copy_capped(&mut decoder, &mut dst, MAX_DECOMPRESSED_DB_BYTES)?;
         } else {
             let mut decoder = GzDecoder::new(src);
-            io::copy(&mut decoder, &mut dst)?;
+            copy_capped(&mut decoder, &mut dst, MAX_DECOMPRESSED_DB_BYTES)?;
         }
         dst.flush()?;
     }
@@ -144,18 +254,16 @@ pub fn cmd_fetch(
         let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         drop(conn);
         if check != "ok" {
-            fs::remove_file(&tmp_db).ok();
-            anyhow::bail!("Decompressed SQLite quick_check failed: {check}");
+            bail!("Decompressed SQLite quick_check failed: {check}");
         }
     }
 
-    if let Some(parent) = out.parent() {
-        fs::create_dir_all(parent)?;
-    }
     atomic_replace(&tmp_db, out)?;
+    tmp_guard.disarm();
     if let Some(et) = new_etag {
         fs::write(&etag_file, et)?;
     }
+    fs::write(&sha_cache_file, &actual_sha)?;
 
     eprintln!(
         "[+] Decompressed and verified in {}ms -> {} (total {}ms)",
